@@ -142,8 +142,12 @@ fn retrieve<'a, V: VectorView<'a>>(
         BinaryHeap::with_capacity(num_candidates + 1);
     for (i, v) in store.iter().enumerate() {
         let score = NotNan::new(v.score(&query)).unwrap();
-        if heap.len() >= num_candidates && score > heap.peek().unwrap().0 .0 {
-            heap.pop();
+        if heap.len() >= num_candidates {
+            if score > heap.peek().unwrap().0 .0 {
+                heap.pop();
+            } else {
+                continue;
+            }
         }
         heap.push(Reverse((score, i)));
     }

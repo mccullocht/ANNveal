@@ -1,4 +1,4 @@
-use simsimd::{BinarySimilarity, SimSIMD};
+use simsimd::{BinarySimilarity, SpatialSimilarity};
 use std::{io::Write, marker::PhantomData};
 
 // XXX should dimensions be non-zero usize?
@@ -58,7 +58,7 @@ impl<'a> VectorView<'a> for FloatVectorView<'a> {
     }
 
     fn score(&self, other: &Self) -> f32 {
-        SimSIMD::cosine(self.data, other.data).unwrap()
+        SpatialSimilarity::cosine(self.data, other.data).unwrap() as f32
     }
 }
 
@@ -86,7 +86,7 @@ impl<'a> VectorView<'a> for BinaryVectorView<'a> {
     }
 
     fn score(&self, other: &Self) -> f32 {
-        1.0f32 / (1.0f32 + BinarySimilarity::hamming(self.data, other.data).unwrap())
+        1.0f32 / (1.0f32 + BinarySimilarity::hamming(self.data, other.data).unwrap() as f32)
     }
 }
 

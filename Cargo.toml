@@ -9,4 +9,4 @@ edition = "2021"
 clap = { version = "4.5.1", features = ["derive"] }
 memmap2 = "0.9.4"
 ordered-float = "4.2.0"
-simsimd = "3.9.0"
+simsimd = "4.0.0"
