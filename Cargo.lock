@@ -177,9 +177,9 @@ dependencies = [
 
 [[package]]
 name = "simsimd"
-version = "3.9.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6196bee1758be0e1e36187a3daedb00397216fe5d288495b5293830418b6884e"
+checksum = "03b4c174e312e67c04b3e5e37aabbf34e843fb932998131cb42573ae5ecbdbc9"
 dependencies = [
  "cc",
 ]
