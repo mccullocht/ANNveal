@@ -1,8 +1,13 @@
 mod vec;
 
 use std::{
-    cmp::Reverse, collections::BinaryHeap, fs::File, io::BufWriter, num::NonZeroUsize,
-    path::PathBuf, str::FromStr,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashSet},
+    fs::File,
+    io::BufWriter,
+    num::NonZeroUsize,
+    path::PathBuf,
+    str::FromStr,
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -37,6 +42,8 @@ enum Commands {
     },
     /// Search an input vector file using queries from another file.
     Search(SearchArgs),
+    /// Analyze binary vector data.
+    Analyze(AnalyzerArgs),
 }
 
 #[derive(Args)]
@@ -66,6 +73,25 @@ struct SearchArgs {
     // Number of dimensions in input vectors.
     #[arg(short, long)]
     dimensions: NonZeroUsize,
+}
+
+#[derive(Args)]
+struct AnalyzerArgs {
+    /// Path to flat vector file.
+    #[arg(short, long)]
+    binary_vectors: PathBuf,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
+    /// Distribution of population count of each input vector.
+    #[arg(short, long, default_value_t = false)]
+    popcnt: bool,
+    /// Distribution of vectors with a particular bit set.
+    #[arg(short, long, default_value_t = false)]
+    set_dist: bool,
+    /// Distribution of the first word of various sizes.
+    #[arg(short, long, default_value_t = false)]
+    word_dist: bool,
 }
 
 #[derive(Clone)]
@@ -226,6 +252,79 @@ fn search_queries<'a>(
     }
 }
 
+fn analyze(args: AnalyzerArgs) -> std::io::Result<()> {
+    let bin_vector_backing = unsafe { memmap2::Mmap::map(&File::open(args.binary_vectors)?)? };
+    let bin_vector_store = vec::VectorViewStore::<'_, BinaryVectorView<'_>>::new(
+        bin_vector_backing.as_ref(),
+        args.dimensions.get(),
+    );
+
+    if args.popcnt {
+        // This produces a bell curve around the center of the dimensionality.
+        let mut count_dist = Vec::with_capacity(args.dimensions.get() + 1);
+        count_dist.resize(args.dimensions.get() + 1, 0usize);
+        for v in bin_vector_store.iter() {
+            count_dist[v.count_ones() as usize] += 1;
+        }
+        for (i, c) in count_dist.into_iter().enumerate().filter(|(_, c)| c > &0) {
+            println!("{:4} {}", i, c);
+        }
+    }
+
+    if args.set_dist {
+        // Some values occur very infrequently but most are 45-55%
+        let mut set_dist = Vec::with_capacity(args.dimensions.get() + 1);
+        set_dist.resize(args.dimensions.get() + 1, 0usize);
+        for v in bin_vector_store.iter() {
+            for b in v.ones_iter() {
+                set_dist[b] += 1;
+            }
+        }
+        for (i, p) in set_dist
+            .into_iter()
+            .enumerate()
+            .filter(|(_, c)| c > &0)
+            .map(|(i, c)| (i, c as f64 * 100f64 / bin_vector_store.len() as f64))
+        {
+            println!("{:4} {:.2}%", i, p);
+        }
+    }
+
+    if args.word_dist {
+        // Vector words aren't super random, the data set is ~1M but 2^20 bits only covers a quarter
+        // of this or so. At 16 bits it divides the space roughly in half. At 12 bits it covers most of
+        // the space, at 8 bits it covers everything.
+        // If I do LSH with 16 I end up with 96 different "hash functions" I have to perform a lookup
+        // in, which seems prohibitive if I am a completionist. Double the hash size and I only do
+        // 48 posting lookups but each one should have only one result.
+        let mut h8 = HashSet::new();
+        let mut h12 = HashSet::new();
+        let mut h16 = HashSet::new();
+        let mut h20 = HashSet::new();
+        let mut h24 = HashSet::new();
+        let mut h28 = HashSet::new();
+        let mut h32 = HashSet::new();
+        for v in bin_vector_store.iter() {
+            let w0 = v.word_iter().next().unwrap();
+            h8.insert(w0 & 0xff);
+            h12.insert(w0 & 0xfff);
+            h16.insert(w0 & 0xffff);
+            h20.insert(w0 & 0xffff_f);
+            h24.insert(w0 & 0xffff_ff);
+            h28.insert(w0 & 0xffff_fff);
+            h32.insert(w0 & 0xffff_ffff);
+        }
+        println!("h8  {}", h8.len());
+        println!("h12 {}", h12.len());
+        println!("h16 {}", h16.len());
+        println!("h20 {}", h20.len());
+        println!("h24 {}", h24.len());
+        println!("h28 {}", h28.len());
+        println!("h32 {}", h32.len());
+    }
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
@@ -236,5 +335,6 @@ fn main() -> std::io::Result<()> {
             dimensions,
         } => binary_quantize(vectors, output, dimensions),
         Commands::Search(args) => search(args),
+        Commands::Analyze(args) => analyze(args),
     }
 }
