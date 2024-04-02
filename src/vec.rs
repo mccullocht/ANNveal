@@ -1,5 +1,5 @@
 use simsimd::{BinarySimilarity, SpatialSimilarity};
-use std::{io::Write, marker::PhantomData};
+use std::{collections::hash_map::DefaultHasher, hash::Hasher, io::Write, marker::PhantomData};
 
 // XXX should dimensions be non-zero usize?
 
@@ -83,6 +83,12 @@ impl<'a> BinaryVectorView<'a> {
 
     pub fn ones_iter(&self) -> OnesIter<'_> {
         OnesIter::new(self.data)
+    }
+
+    pub fn hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(self.data);
+        hasher.finish()
     }
 }
 
