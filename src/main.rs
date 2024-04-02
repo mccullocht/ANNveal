@@ -1,8 +1,8 @@
 mod vec;
 
 use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fs::File,
     io::BufWriter,
     num::NonZeroUsize,
@@ -12,6 +12,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use ordered_float::NotNan;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use vec::{FloatVectorView, VectorView, VectorViewStore};
 
 use crate::vec::BinaryVectorView;
@@ -92,6 +93,9 @@ struct AnalyzerArgs {
     /// Distribution of the first word of various sizes.
     #[arg(short, long, default_value_t = false)]
     word_dist: bool,
+    /// Distribution of closest centroids.
+    #[arg(short, long, default_value_t = false)]
+    rand_centroids: bool,
 }
 
 #[derive(Clone)]
@@ -322,6 +326,53 @@ fn analyze(args: AnalyzerArgs) -> std::io::Result<()> {
         println!("h28 {}", h28.len());
         println!("h32 {}", h32.len());
     }
+
+    if args.rand_centroids {
+        let centroid_indices: Vec<usize> = bin_vector_store
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if v.hash() % 6 == 0 { Some(i) } else { None })
+            .collect();
+        let closest_centroids: Vec<usize> = (0..bin_vector_store.len())
+            .into_par_iter()
+            .map(|i| {
+                let v = bin_vector_store.get(i);
+                centroid_indices
+                    .iter()
+                    .map(|c| (v.score(&bin_vector_store.get(*c)), *c))
+                    .max_by(|a, b| match a.0.partial_cmp(&b.0).unwrap() {
+                        Ordering::Equal => a.1.cmp(&b.1),
+                        Ordering::Less => Ordering::Less,
+                        Ordering::Greater => Ordering::Greater,
+                    })
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        let mut centroid_counts: HashMap<usize, usize> = HashMap::new();
+        for c in closest_centroids {
+            centroid_counts
+                .entry(c)
+                .and_modify(|n| *n += 1)
+                .or_insert(1);
+        }
+        let mut pl_lengths: BTreeMap<usize, usize> = BTreeMap::new();
+        for v in centroid_counts.values() {
+            pl_lengths.entry(*v).and_modify(|n| *n += 1).or_insert(1);
+        }
+        let num_pls: usize = pl_lengths.values().sum();
+        let mut total = 0usize;
+        for (l, c) in pl_lengths {
+            total += c;
+            println!(
+                "{:3} {:7} {:.2}%",
+                l,
+                c,
+                total as f64 * 100.0 / num_pls as f64
+            );
+        }
+    }
+
     Ok(())
 }
 
