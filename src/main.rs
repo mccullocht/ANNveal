@@ -1,7 +1,7 @@
 mod vec;
 
 use std::{
-    cmp::{Ordering, Reverse},
+    cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fs::File,
     io::BufWriter,
@@ -11,11 +11,13 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
+use hnsw::{Hnsw, Searcher};
 use ordered_float::NotNan;
+use rand_pcg::Pcg64;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use vec::{FloatVectorView, VectorView, VectorViewStore};
-
-use crate::vec::BinaryVectorView;
+use serde::Serialize;
+use space::{Metric, Neighbor};
+use vec::{BinaryVectorView, FloatVectorView, VectorView, VectorViewStore};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -45,6 +47,8 @@ enum Commands {
     Search(SearchArgs),
     /// Analyze binary vector data.
     Analyze(AnalyzerArgs),
+    /// Build an HNSW index of random vectors from a binary query file.
+    BuildCentroidIndex(BuildCentroidIndex),
 }
 
 #[derive(Args)]
@@ -96,6 +100,22 @@ struct AnalyzerArgs {
     /// Distribution of closest centroids.
     #[arg(short, long, default_value_t = false)]
     rand_centroids: bool,
+}
+
+#[derive(Args)]
+struct BuildCentroidIndex {
+    /// Path to flat binary vector file to use as input.
+    #[arg(short, long)]
+    binary_vectors: PathBuf,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
+    /// Path to output index file.
+    #[arg(short, long)]
+    index: PathBuf,
+    /// Fraction of input vector to select for the index.
+    #[arg(short, long)]
+    frac: f64,
 }
 
 #[derive(Clone)]
@@ -256,6 +276,17 @@ fn search_queries<'a>(
     }
 }
 
+#[derive(Serialize)]
+struct Hamming;
+
+impl<'a> Metric<BinaryVectorView<'a>> for Hamming {
+    type Unit = u32;
+
+    fn distance(&self, a: &BinaryVectorView<'a>, b: &BinaryVectorView<'a>) -> Self::Unit {
+        a.distance(b)
+    }
+}
+
 fn analyze(args: AnalyzerArgs) -> std::io::Result<()> {
     let bin_vector_backing = unsafe { memmap2::Mmap::map(&File::open(args.binary_vectors)?)? };
     let bin_vector_store = vec::VectorViewStore::<'_, BinaryVectorView<'_>>::new(
@@ -328,25 +359,33 @@ fn analyze(args: AnalyzerArgs) -> std::io::Result<()> {
     }
 
     if args.rand_centroids {
-        let centroid_indices: Vec<usize> = bin_vector_store
+        // XXX I can probably revert almost everything I'm just getting a version mismatch since
+        // hnsw doesn't re-export space::Metric
+        let mut hnsw: Hnsw<Hamming, BinaryVectorView, Pcg64, 12, 24> = Hnsw::new(Hamming);
+        let mut searcher = Searcher::default();
+        println!("building hnsw index");
+        for (i, v) in bin_vector_store
             .iter()
+            .filter(|v| v.hash() % 6 == 0)
             .enumerate()
-            .filter_map(|(i, v)| if v.hash() % 6 == 0 { Some(i) } else { None })
-            .collect();
+        {
+            if i % 10000 == 0 {
+                println!("{}", i);
+            }
+            hnsw.insert(v, &mut searcher);
+        }
+        println!("done building hnsw index");
         let closest_centroids: Vec<usize> = (0..bin_vector_store.len())
             .into_par_iter()
             .map(|i| {
-                let v = bin_vector_store.get(i);
-                centroid_indices
-                    .iter()
-                    .map(|c| (v.score(&bin_vector_store.get(*c)), *c))
-                    .max_by(|a, b| match a.0.partial_cmp(&b.0).unwrap() {
-                        Ordering::Equal => a.1.cmp(&b.1),
-                        Ordering::Less => Ordering::Less,
-                        Ordering::Greater => Ordering::Greater,
-                    })
-                    .unwrap()
-                    .1
+                let p = bin_vector_store.get(i);
+                let mut searcher = Searcher::default();
+                let mut closest = [Neighbor {
+                    index: 0usize,
+                    distance: 0u32,
+                }; 1];
+                hnsw.nearest(&p, 25, &mut searcher, &mut closest);
+                closest[0].index
             })
             .collect();
         let mut centroid_counts: HashMap<usize, usize> = HashMap::new();
@@ -376,6 +415,31 @@ fn analyze(args: AnalyzerArgs) -> std::io::Result<()> {
     Ok(())
 }
 
+fn build_centroid_index(args: BuildCentroidIndex) -> std::io::Result<()> {
+    let bin_vector_backing = unsafe { memmap2::Mmap::map(&File::open(args.binary_vectors)?)? };
+    let bin_vector_store = vec::VectorViewStore::<'_, BinaryVectorView<'_>>::new(
+        bin_vector_backing.as_ref(),
+        args.dimensions.get(),
+    );
+    let max_hash = u64::MAX / 1000 * ((args.frac * 1000.0) as u64);
+    let mut hnsw: Hnsw<Hamming, BinaryVectorView, Pcg64, 12, 24> = Hnsw::new(Hamming);
+    let mut searcher = Searcher::default();
+    for (i, v) in bin_vector_store
+        .iter()
+        .filter(|v| v.hash() <= max_hash)
+        .enumerate()
+    {
+        if i % 10000 == 0 {
+            println!("{}", i);
+        }
+        hnsw.insert(v, &mut searcher);
+    }
+
+    let mut w = BufWriter::new(File::create(args.index)?);
+    rmp_serde::encode::write(&mut w, &hnsw).unwrap();
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
@@ -387,5 +451,6 @@ fn main() -> std::io::Result<()> {
         } => binary_quantize(vectors, output, dimensions),
         Commands::Search(args) => search(args),
         Commands::Analyze(args) => analyze(args),
+        Commands::BuildCentroidIndex(args) => build_centroid_index(args),
     }
 }

@@ -1,3 +1,4 @@
+use serde::Serialize;
 use simsimd::{BinarySimilarity, SpatialSimilarity};
 use std::{collections::hash_map::DefaultHasher, hash::Hasher, io::Write, marker::PhantomData};
 
@@ -62,6 +63,7 @@ impl<'a> VectorView<'a> for FloatVectorView<'a> {
     }
 }
 
+#[derive(Serialize)]
 pub struct BinaryVectorView<'a> {
     data: &'a [u8],
     dimensions: usize,
@@ -89,6 +91,10 @@ impl<'a> BinaryVectorView<'a> {
         let mut hasher = DefaultHasher::new();
         hasher.write(self.data);
         hasher.finish()
+    }
+
+    pub fn distance(&self, other: &Self) -> u32 {
+        BinarySimilarity::hamming(self.data, other.data).unwrap() as u32
     }
 }
 
