@@ -1,3 +1,6 @@
+// XXX remove this
+#[allow(dead_code)]
+mod vamana;
 mod vec;
 
 use std::{
