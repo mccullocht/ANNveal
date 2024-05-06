@@ -3,6 +3,7 @@ import java.lang.Iterable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Implement a Vamana graph for approximate nearest neighbor (ANN) search as
@@ -11,9 +12,50 @@ import java.util.Set;
  * HNSW but the graph is flat rather than having multiple levels.
  * 
  * For this graph vectors will be 64-bit integers and use hamming distance as
- * the distance metric.
+ * the distance metric. Hamming distance counts the number of bits that differ
+ * between two values, so for instance 1, 2, 4, and 8 are all distance 1 from 0.
+ * 
+ * For testing search(), consider using VamanaGraph.createTestGraph() to make
+ * a small graph with some constant values or a simple sequence.
  */
 public class VamanaGraph {
+    /**
+     * A single node in the graph.
+     * 
+     * @param vector the vector value for this node.
+     * @param edges  a list of outbound links to other nodes. This list should be no
+     *               longer than maxDegree.
+     */
+    record Node(long vector, List<Node> edges) {
+        @Override
+        public final boolean equals(Object o) {
+            return o instanceof Node && this.vector == ((Node) o).vector;
+        }
+
+        @Override
+        public final int hashCode() {
+            return Long.hashCode(this.vector);
+        }
+    }
+
+    /**
+     * A neighbor node and its distance from the query. Neighbors are sorted first
+     * by distance then by node.
+     */
+    public record Neighbor(Node node, int distance) implements Comparable<Neighbor> {
+        @Override
+        public int compareTo(Neighbor o) {
+            int cmp = Integer.compare(this.distance, o.distance);
+            return cmp == 0 ? Long.compare(this.node.vector, o.node.vector) : cmp;
+        }
+    }
+
+    /**
+     * A list of the top k search results and the set of all nodes visited.
+     */
+    public record SearchResult(List<Neighbor> searchResults, List<Node> visited) {
+    }
+
     /**
      * Search for the query vector, returning an approximation of the closest
      * results and the set of node visited.
@@ -27,13 +69,13 @@ public class VamanaGraph {
      *   Data: Graph G with start node s, query q, result size k, search list size L ≥ k
      *   Result: Result set R containing k-approx NNs, and a set V containing all the visited nodes
      *   begin
-     *     initialize sets L ← {s} and V ← {}
+     *     initialize sets R ← {s} and V ← {}
      *     while R - V != {} do
-     *       let p ← q where q min distance(p, q) in (R - V)
+     *       let p ← r where r has min distance(q, r) for all r in (R - V)
      *       R.addAll(p.edges)
      *       V.add(p)
      *       if R.size > L then
-     *         update R to retain closest L points to q
+     *         update R to retain closest searchListSize points to q
      *       return [closest k points from R; V]
      * </code>
      * 
@@ -44,9 +86,9 @@ public class VamanaGraph {
      * @return the top K results from the search list and all of the visited
      *         candidates.
      */
-    public SearchResult search(long query, int k, int numCandidates) {
-        if (k > numCandidates) {
-            throw new IllegalArgumentException("k must be less than numCandidates");
+    public SearchResult search(long query, int k, int searchListSize) {
+        if (k > searchListSize) {
+            throw new IllegalArgumentException("require: k <= searchListSize");
         }
         throw new UnsupportedOperationException("unimplemented");
     }
@@ -54,18 +96,16 @@ public class VamanaGraph {
     /**
      * Add a vector to the graph.
      * 
-     * <code>
-     * Algorithm:
-     *   * search for vector to obtain visited set
-     *   * prune visited set to params.maxDegrees
-     *   * insert node in graph with pruned neighbors
-     *   * update each neighbor to point back to the new node
-     * </code>
-     * 
      * @param vector the vector to add to the graph.
      */
     public void add(long vector) {
-        throw new UnsupportedOperationException("unimplemented");
+        Node n = new Node(vector, search(vector, params.beamWidth, params.beamWidth).visited);
+        robustPrune(n);
+        this.nodes.add(n);
+        for (Node e : n.edges) {
+            e.edges.add(n);
+            robustPrune(e);
+        }
     }
 
     /**
@@ -74,18 +114,18 @@ public class VamanaGraph {
      * This is listed as Algorithm 2 (RobustPrune()) in the paper.
      * <code>
      * Algorithm 2: RobustPrune(p, V, α, maxDegree)
-     *  Data: Graph G, point p ∈ P, candidate set V, distance threshold α ≥ 1, degree bound maxDegree
+     *  Data: Graph G, point p , candidate set V, distance threshold α ≥ 1, degree bound maxDegree
      *  Result: G is modified by setting at most maxDegree new out-neighbors for p
      *  begin
      *    V.addAll(p.edges)
      *    p.edges.clear();
      *    while V != {} do
-     *      q ← r where r min distance(p, r) in V
+     *      q ← r where r has min distance(p, r) for all r in V
      *      p.edges.add(q)
      *      if p.edges.size() == maxDegree then
      *        break
      *      for r in V do
-     *        if α · distance(r, q) ≤ d(p, q) then
+     *        if α · distance(r, q) ≤ distance(p, q) then
      *          remove r from V
      * </code>
      * 
@@ -93,6 +133,10 @@ public class VamanaGraph {
      * @return
      */
     void robustPrune(Node node) {
+        if (node.edges.size() <= this.params.maxDegree) {
+            return;
+        }
+
         throw new UnsupportedOperationException("unimplemented");
     }
 
@@ -113,16 +157,6 @@ public class VamanaGraph {
         }
     }
 
-    /**
-     * A single node in the graph.
-     * 
-     * @param vector the vector value for this node.
-     * @param edges  a list of other nodes by index ordinal. This list should be no
-     *               longer than params.maxDegree.
-     */
-    record Node(Long vector, List<Integer> edges) {
-    }
-
     final ConstructionParams params;
 
     /**
@@ -136,18 +170,36 @@ public class VamanaGraph {
      * @param params constructions parameters used when adding nodes to the graph.
      */
     public VamanaGraph(ConstructionParams params) {
-        this(params, List.of());
+        this(params, new ArrayList<>());
+    }
+
+    private VamanaGraph(ConstructionParams params, List<Node> nodes) {
+        this.params = params;
+        this.nodes = nodes;
     }
 
     /**
-     * Initialize with a pre-built graph.
+     * Create a new graph from the provided vectors for testing search().
      * 
-     * @param params constructions parameters used when adding nodes to the graph.
-     * @param nodes  list of nodes and edges.
+     * This exhaustively computes node distance (O(N^2)) and crudely prunes the
+     * set of edges to the closest nodes.
+     * 
+     * @param vectors to include in the graph
+     * @return a graph containing all the vectors with edges between them.
      */
-    public VamanaGraph(ConstructionParams params, List<Node> nodes) {
-        this.params = params;
-        this.nodes = new ArrayList<>(nodes);
+    public static VamanaGraph createTestGraph(ConstructionParams params, List<Long> vectors) {
+        // Insert every vector into the graph with no edges.
+        var graph = new VamanaGraph(params, vectors.stream().map(v -> new Node(v, new ArrayList<>()))
+                .collect(Collectors.toCollection(() -> new ArrayList<>(params.maxDegree))));
+        for (Node node : graph.nodes) {
+            // Compute the distance between this node and every other node in the graph,
+            // then take the maxDegree closest values and insert those nodes as edges.
+            node.edges.addAll(graph.nodes.stream().filter(n -> node != n)
+                    .map(n -> new Neighbor(n, hammingDistance(node.vector, n.vector))).sorted().limit(params.maxDegree)
+                    .map(neighbor -> neighbor.node)
+                    .collect(Collectors.toCollection(ArrayList::new)));
+        }
+        return graph;
     }
 
     /**
@@ -163,25 +215,6 @@ public class VamanaGraph {
      */
     public long getVector(int i) {
         return this.nodes.get(i).vector;
-    }
-
-    /**
-     * A neighbor, expressed as an index ordinal in the node graph and a distance.
-     * 
-     * By default, Neighbors are sorted first by distance then by index.
-     */
-    public record Neighbor(int index, int distance) implements Comparable<Neighbor> {
-        @Override
-        public int compareTo(Neighbor o) {
-            int cmp = Integer.compare(this.distance, o.distance);
-            return cmp == 0 ? Integer.compare(this.index, o.index) : cmp;
-        }
-    }
-
-    /**
-     * A list of the top k search results and the set of all nodes visited.
-     */
-    public record SearchResult(List<Neighbor> searchResults, List<Integer> visited) {
     }
 
     /**
@@ -216,27 +249,3 @@ public class VamanaGraph {
 // * alpha > 1.0
 // * Concurrent graph build
 // * Partitioned graph build using kmeans clustering; described in the paper.
-class OmitFromPrompt {
-    // Small graph with vector values in 0..16 with maxDegree of 4.
-    // In this graph the distance from each node to all of its edges is 1.
-    static VamanaGraph smallGraph() {
-        return new VamanaGraph(
-                new VamanaGraph.ConstructionParams(4, 10, 1.0f),
-                List.of(new VamanaGraph.Node(0L, List.of(1, 2, 4, 8)),
-                        new VamanaGraph.Node(1L, List.of(0, 3, 5, 9)),
-                        new VamanaGraph.Node(2L, List.of(0, 3, 6, 10)),
-                        new VamanaGraph.Node(3L, List.of(1, 2, 7, 11)),
-                        new VamanaGraph.Node(4L, List.of(0, 5, 6, 12)),
-                        new VamanaGraph.Node(5L, List.of(1, 4, 7, 13)),
-                        new VamanaGraph.Node(6L, List.of(2, 4, 7, 14)),
-                        new VamanaGraph.Node(7L, List.of(3, 5, 6, 15)),
-                        new VamanaGraph.Node(8L, List.of(0, 9, 10, 12)),
-                        new VamanaGraph.Node(9L, List.of(1, 8, 11, 13)),
-                        new VamanaGraph.Node(10L, List.of(2, 8, 11, 14)),
-                        new VamanaGraph.Node(11L, List.of(3, 9, 10, 15)),
-                        new VamanaGraph.Node(12L, List.of(4, 8, 13, 14)),
-                        new VamanaGraph.Node(13L, List.of(5, 9, 12, 15)),
-                        new VamanaGraph.Node(14L, List.of(6, 10, 12, 15)),
-                        new VamanaGraph.Node(15L, List.of(7, 11, 13, 14))));
-    }
-}
