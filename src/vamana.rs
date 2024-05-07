@@ -5,9 +5,12 @@
 // expect to search the same number of nodes. We would use the same result set size but increase
 // the size of the candidates heap proportionally to avoid dropping stuff.
 
+use core::num;
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
+    io::Write,
+    iter::FusedIterator,
     num::NonZeroUsize,
 };
 
@@ -25,6 +28,7 @@ pub trait VectorStore {
     /// *Panics* if `i`` is out of bounds.
     fn get(&self, i: usize) -> &Self::Vector;
 
+    /// Obtain an iterator over vector data.
     fn vector_iter(&self) -> Self::VectorIter<'_>;
 
     /// Compute the mean point from the data set.
@@ -82,14 +86,14 @@ impl PartialOrd for Neighbor {
 
 /// Graph access.
 pub trait Graph {
-    type NeighborOrdIterator<'c>: Iterator<Item = usize>
+    type NeighborEdgeIterator<'c>: Iterator<Item = usize>
     where
         Self: 'c;
 
     // Returns the entry point to the graph if any nodes have been populated.
     fn entry_point(&self) -> Option<usize>;
     /// Return an iterate over the list of nodes neighboring `ord`.
-    fn neighbors_iter(&self, i: usize) -> Self::NeighborOrdIterator<'_>;
+    fn neighbors_iter(&self, i: usize) -> Self::NeighborEdgeIterator<'_>;
     /// Return the number of nodes in the graph.
     fn len(&self) -> usize;
 }
@@ -376,7 +380,6 @@ where
 pub struct MutableGraph {
     entry_point: Option<u32>,
     nodes: Vec<Vec<Neighbor>>,
-    edges: usize,
 }
 
 impl MutableGraph {
@@ -384,7 +387,6 @@ impl MutableGraph {
         Self {
             entry_point: None,
             nodes: vec![Vec::with_capacity(max_degree.get() * 2); len],
-            edges: 0usize,
         }
     }
 
@@ -399,16 +401,34 @@ impl MutableGraph {
     fn add_neighbor(&mut self, node: usize, neighbor: Neighbor) -> bool {
         let node = &mut self.nodes[node];
         node.push(neighbor);
-        self.edges += 1;
         node.len() == node.capacity()
     }
 
     fn set_neighbors(&mut self, node: usize, neighbors: &[Neighbor]) {
         let node = &mut self.nodes[node];
-        self.edges += neighbors.len();
-        self.edges -= node.len();
         node.clear();
         node.extend_from_slice(neighbors)
+    }
+
+    pub fn write(&self, out: &mut impl Write) -> std::io::Result<()> {
+        out.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
+        out.write_all(&(self.entry_point.unwrap_or(0) as u32).to_le_bytes())?;
+        // Write the number of nodes at the start of each edge and at the end. This way we will
+        // write self.nodes.len() + 1 values for edge extents.
+        out.write_all(&0u64.to_le_bytes())?;
+        // This is ~8MB per ~1M nodes
+        let mut num_edges = 0u64;
+        for n in self.nodes.iter() {
+            num_edges += n.len() as u64;
+            out.write_all(&num_edges.to_le_bytes())?;
+        }
+        // This is ~120MB per ~1M nodes. If we did simple bit-width compression it would be ~75MB.
+        for n in self.nodes.iter() {
+            for e in n {
+                out.write_all(&e.id.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -430,21 +450,129 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         self.it.next().map(|x| x.id as usize)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.it.size_hint()
+    }
 }
 
+impl<'a> ExactSizeIterator for NeighborNodeIterator<'a> {}
+
+impl<'a> FusedIterator for NeighborNodeIterator<'a> {}
+
 impl Graph for MutableGraph {
-    type NeighborOrdIterator<'c> = NeighborNodeIterator<'c> where Self: 'c;
+    type NeighborEdgeIterator<'c> = NeighborNodeIterator<'c> where Self: 'c;
 
     fn entry_point(&self) -> Option<usize> {
         self.entry_point.map(|p| p as usize)
     }
 
-    fn neighbors_iter(&self, ord: usize) -> Self::NeighborOrdIterator<'_> {
+    fn neighbors_iter(&self, ord: usize) -> Self::NeighborEdgeIterator<'_> {
         NeighborNodeIterator::new(&self.nodes[ord])
     }
 
     fn len(&self) -> usize {
         self.nodes.len()
+    }
+}
+
+pub struct ImmutableMemoryGraph<'a> {
+    entry_point: Option<u32>,
+    node_extents: &'a [u64],
+    edges: &'a [u32],
+}
+
+impl<'a> ImmutableMemoryGraph<'a> {
+    pub fn new(rep: &'a [u8]) -> Result<Self, &'static str> {
+        if rep.len() < 8 {
+            return Err("rep too short to contain a valid graph");
+        }
+        let (num_nodes, rep) = Self::decode_u32(rep);
+        if num_nodes == 0 {
+            return Ok(Self {
+                entry_point: None,
+                node_extents: &[],
+                edges: &[],
+            });
+        }
+        let (entry_point, rep) = Self::decode_u32(rep);
+        if entry_point >= num_nodes {
+            return Err("invalid entry point");
+        }
+        let node_extent_bytes = std::mem::size_of::<u64>() * (num_nodes as usize + 1);
+        if rep.len() < node_extent_bytes {
+            return Err("rep too short to contain all node extents");
+        }
+        let (prefix, node_extents, suffix) = unsafe { rep[0..node_extent_bytes].align_to::<u64>() };
+        if !prefix.is_empty() || !suffix.is_empty() {
+            return Err("rep does not align to u64 for node_extents");
+        }
+        let num_edges = node_extents.last().unwrap().to_le();
+        let edges_bytes = num_edges as usize * std::mem::size_of::<u32>();
+        if rep.len() < node_extent_bytes + edges_bytes {
+            return Err("rep too short to contain all edges");
+        }
+        let (prefix, edges, suffix) =
+            unsafe { rep[node_extent_bytes..(node_extent_bytes + edges_bytes)].align_to::<u32>() };
+        if !prefix.is_empty() || !suffix.is_empty() {
+            return Err("rep does not align to u32 for edges");
+        }
+        Ok(Self {
+            entry_point: Some(entry_point),
+            node_extents,
+            edges,
+        })
+    }
+
+    fn decode_u32(rep: &[u8]) -> (u32, &[u8]) {
+        let (u32rep, rep) = rep.split_at(std::mem::size_of::<u32>());
+        (u32::from_le_bytes(u32rep.try_into().unwrap()), rep)
+    }
+}
+
+pub struct ImmutableEdgeIterator<'a> {
+    it: std::slice::Iter<'a, u32>,
+}
+
+impl<'a, 'b> ImmutableEdgeIterator<'a> {
+    fn new(graph: &'b ImmutableMemoryGraph<'a>, node: usize) -> Self {
+        let begin = graph.node_extents[node] as usize;
+        let end = graph.node_extents[node + 1] as usize;
+        Self {
+            it: graph.edges[begin..end].iter(),
+        }
+    }
+}
+
+impl<'a> Iterator for ImmutableEdgeIterator<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|e| *e as usize)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.it.size_hint()
+    }
+}
+
+impl<'a> ExactSizeIterator for ImmutableEdgeIterator<'a> {}
+
+impl<'a> FusedIterator for ImmutableEdgeIterator<'a> {}
+
+impl<'a> Graph for ImmutableMemoryGraph<'a> {
+    type NeighborEdgeIterator<'c> = ImmutableEdgeIterator<'c> where Self: 'c;
+
+    fn entry_point(&self) -> Option<usize> {
+        self.entry_point.map(|p| p as usize)
+    }
+
+    fn neighbors_iter(&self, node: usize) -> Self::NeighborEdgeIterator<'_> {
+        ImmutableEdgeIterator::new(self, node)
+    }
+
+    fn len(&self) -> usize {
+        self.node_extents.len() - 1
     }
 }
 
@@ -456,7 +584,10 @@ mod test {
 
     use crate::vamana::Graph;
 
-    use super::{GraphBuilder, GraphSearcher, MutableGraph, Neighbor, Scorer, VectorStore};
+    use super::{
+        GraphBuilder, GraphSearcher, ImmutableMemoryGraph, MutableGraph, Neighbor, Scorer,
+        VectorStore,
+    };
 
     impl VectorStore for Vec<u64> {
         type Vector = u64;
@@ -604,6 +735,40 @@ mod test {
         let graph: MutableGraph = builder.finish();
         let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
         let results = searcher.search(&graph, &store, &64, &Hamming64);
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|n| (n.id, n.score.into_inner()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0.984375),
+                (1, 0.96875),
+                (2, 0.96875),
+                (4, 0.96875),
+                (8, 0.96875),
+                (3, 0.953125),
+                (5, 0.953125),
+                (6, 0.953125),
+            ]
+        );
+    }
+
+    #[test]
+    fn serialize_graph() {
+        let store: Vec<u64> = (0u64..16u64).collect();
+        let mut builder = make_builder(&store);
+        builder.add_all_vectors();
+        let mutable_graph: MutableGraph = builder.finish();
+        let mut serialized_graph = Vec::new();
+        mutable_graph.write(&mut serialized_graph).unwrap();
+        let immutable_graph = ImmutableMemoryGraph::new(&serialized_graph).unwrap();
+
+        assert_eq!(get_neighbors(&immutable_graph, 0), vec![1, 2, 4, 8]);
+        assert_eq!(get_neighbors(&immutable_graph, 7), vec![3, 5, 6, 15]);
+        assert_eq!(get_neighbors(&immutable_graph, 8), vec![0, 9, 10, 12]);
+        assert_eq!(get_neighbors(&immutable_graph, 15), vec![7, 11, 13, 14]);
+        let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
+        let results = searcher.search(&immutable_graph, &store, &64, &Hamming64);
         assert_eq!(
             results
                 .into_iter()
