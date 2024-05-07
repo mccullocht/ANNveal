@@ -14,13 +14,11 @@ use std::{
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        RwLock, RwLockReadGuard,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use ahash::AHashSet;
+use crossbeam_epoch::{pin, Atomic, Guard, Owned};
 use crossbeam_skiplist::SkipSet;
 use ordered_float::NotNan;
 use rayon::{
@@ -388,6 +386,8 @@ where
         let mut pruned = Vec::with_capacity(self.max_degree);
         let mut cur_alpha = NotNan::new(1.0f32).expect("not NaN constant");
         let max_alpha = NotNan::new(self.alpha).expect("not NaN constant");
+        // XXX you might be able to count the numbet pruned and write a filter to generate the
+        // values at end by zipping with pruned
         while cur_alpha <= max_alpha && pruned.len() < self.max_degree {
             for (i, n) in neighbors.iter().enumerate() {
                 if pruned.len() >= self.max_degree {
@@ -425,15 +425,13 @@ const INITIAL_ENTRY_POINT: Neighbor = Neighbor {
 pub struct MutableGraph {
     max_degree: usize,
     entry_point: AtomicU64,
-    nodes: Vec<RwLock<Vec<Neighbor>>>,
+    nodes: Vec<Atomic<Vec<Neighbor>>>,
 }
 
 impl MutableGraph {
     fn new(len: usize, max_degree: NonZeroUsize) -> Self {
         let mut nodes = Vec::with_capacity(len);
-        nodes.resize_with(len, || {
-            RwLock::new(Vec::with_capacity(max_degree.get() * 2))
-        });
+        nodes.resize_with(len, Atomic::null);
         Self {
             max_degree: max_degree.get(),
             entry_point: AtomicU64::new(INITIAL_ENTRY_POINT.into()),
@@ -471,46 +469,79 @@ impl MutableGraph {
     where
         P: Fn(&[Neighbor]) -> Vec<Neighbor>,
     {
-        let mut edges = self.nodes[node].write().unwrap();
-        assert_ne!(node, neighbor.id as usize);
-        if let Err(index) = edges.binary_search(&neighbor) {
-            edges.insert(index, neighbor);
-            if edges.len() >= edges.capacity() {
-                let pruned = prune(&edges);
-                edges.clear();
-                edges.extend_from_slice(&pruned);
+        self.update_edges(node, |edges| {
+            if let Err(index) = edges.binary_search(&neighbor) {
+                let mut new_edges = Owned::new(Vec::with_capacity(edges.len() + 1));
+                new_edges.extend_from_slice(&edges[..index]);
+                new_edges.push(neighbor);
+                new_edges.extend_from_slice(&edges[index..]);
+                if new_edges.len() >= self.max_degree * 2 {
+                    new_edges = Owned::new(prune(&new_edges));
+                }
+                Some(new_edges)
+            } else {
+                None
             }
-        }
+        })
     }
 
     fn insert_neighbors<P>(&self, node: usize, neighbors: &[Neighbor], prune: P)
     where
         P: Fn(&[Neighbor]) -> Vec<Neighbor>,
     {
-        let mut edges = self.nodes[node].write().unwrap();
-        for n in neighbors {
-            // TODO we can use the last binary search index as a starting point, and if the value
-            // belongs at the end we could extend_from_slice instead of this.
-            if let Err(index) = edges.binary_search(n) {
-                edges.insert(index, *n);
-                if edges.len() >= edges.capacity() {
-                    let pruned = prune(&edges);
-                    edges.clear();
-                    edges.extend_from_slice(&pruned);
-                }
+        self.update_edges(node, |edges| {
+            let mut new_edges = Owned::new(Vec::with_capacity(edges.len() + neighbors.len()));
+            // XXX can almost certainly do better than this.
+            new_edges.extend_from_slice(neighbors);
+            new_edges.extend_from_slice(edges);
+            new_edges.sort_unstable();
+            new_edges.dedup();
+            if new_edges.len() >= self.max_degree * 2 {
+                Some(Owned::new(prune(&new_edges)))
+            } else {
+                Some(new_edges)
             }
-        }
+        })
     }
 
     fn maybe_prune_neighbors<P>(&self, node: usize, prune: P)
     where
         P: Fn(&[Neighbor]) -> Vec<Neighbor>,
     {
-        let mut edges = self.nodes[node].write().unwrap();
-        if edges.len() >= self.max_degree {
-            let pruned = prune(&edges);
-            edges.clear();
-            edges.extend_from_slice(&pruned);
+        self.update_edges(node, |edges| {
+            if edges.len() > self.max_degree {
+                Some(Owned::new(prune(edges)))
+            } else {
+                None
+            }
+        });
+    }
+
+    fn update_edges<U>(&self, node: usize, update_neighbors: U)
+    where
+        U: Fn(&[Neighbor]) -> Option<Owned<Vec<Neighbor>>>,
+    {
+        let guard = &pin();
+        let edges = &self.nodes[node];
+        let mut last = edges.load_consume(guard);
+        while let Some(update) =
+            update_neighbors(unsafe { last.as_ref() }.map(|e| e.as_ref()).unwrap_or(&[]))
+        {
+            match edges.compare_exchange_weak(
+                last,
+                update,
+                Ordering::Acquire,
+                Ordering::Acquire,
+                guard,
+            ) {
+                Ok(_) => {
+                    if !last.is_null() {
+                        unsafe { guard.defer_destroy(last) };
+                    }
+                    break;
+                }
+                Err(e) => last = e.current,
+            }
         }
     }
 
@@ -522,12 +553,22 @@ impl MutableGraph {
         out.write_all(&0u64.to_le_bytes())?;
         // This is ~8MB per ~1M nodes
         let mut num_edges = 0u64;
-        for n in self.nodes.iter().map(|n| n.read().unwrap()) {
-            num_edges += n.len() as u64;
+        for n in self.nodes.iter().map(|n| unsafe {
+            n.load_consume(&pin())
+                .as_ref()
+                .map(|e| e.len())
+                .unwrap_or(0)
+        }) {
+            num_edges += n as u64;
             out.write_all(&num_edges.to_le_bytes())?;
         }
         // This is ~120MB per ~1M nodes. If we did simple bit-width compression it would be ~75MB.
-        for n in self.nodes.iter().map(|n| n.read().unwrap()) {
+        // XXX we clone all the edges during write, which kind of sucks.
+        for n in self
+            .nodes
+            .iter()
+            .map(|n| unsafe { n.load_consume(&pin()).deref().clone() })
+        {
             for e in n.iter() {
                 out.write_all(&e.id.to_le_bytes())?;
             }
@@ -537,15 +578,27 @@ impl MutableGraph {
 }
 
 pub struct NeighborNodeIterator<'a> {
-    guard: RwLockReadGuard<'a, Vec<Neighbor>>,
+    pin: Guard,
+    neighbors: &'a Atomic<Vec<Neighbor>>,
     next: usize,
 }
 
 impl<'a> NeighborNodeIterator<'a> {
-    fn new(neighbors: &'a RwLock<Vec<Neighbor>>) -> Self {
+    fn new(neighbors: &'a Atomic<Vec<Neighbor>>) -> Self {
         Self {
-            guard: neighbors.read().unwrap(),
+            pin: pin(),
+            neighbors,
             next: 0,
+        }
+    }
+
+    fn edges(&self) -> &[Neighbor] {
+        unsafe {
+            self.neighbors
+                .load_consume(&self.pin)
+                .as_ref()
+                .map(|e| e.as_ref())
+                .unwrap_or(&[])
         }
     }
 }
@@ -554,21 +607,17 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.guard.len() {
+        let edges = self.edges();
+        if self.next >= edges.len() {
             return None;
         }
-
-        let i = self.next;
+        let result = Some(edges[self.next].id as usize);
         self.next += 1;
-        Some(self.guard[i].id as usize)
+        result
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = if self.next < self.guard.len() {
-            self.guard.len() - self.next
-        } else {
-            0
-        };
+        let size = self.edges().len() - self.next;
         (size, Some(size))
     }
 }
@@ -598,8 +647,20 @@ impl Graph for MutableGraph {
     }
 }
 
-/// In immutable graph implementation that can be loaded from a byte slice.
-// XXX would rather accept AsRef<[u8]> but there are self-referential struct problems there.
+impl Drop for MutableGraph {
+    fn drop(&mut self) {
+        let guard = &pin();
+        for n in self.nodes.iter_mut() {
+            unsafe {
+                let to_drop = std::mem::replace(n, Atomic::null());
+                if !to_drop.load_consume(guard).is_null() {
+                    drop(to_drop.into_owned());
+                }
+            }
+        }
+    }
+}
+
 pub struct ImmutableMemoryGraph<'a> {
     entry_point: Option<u32>,
     node_extents: &'a [u64],
