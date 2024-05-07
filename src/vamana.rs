@@ -13,27 +13,26 @@ use std::{
 
 use ordered_float::NotNan;
 
-/// Ordinal identifier for vectors in the data store and graph.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct VectorId(u32);
-
-/// Ordinal indexed store for vector data.
-// XXX I need a way to iterate over vector ids. Range uses an unstabilized trait.
+/// Dense store of vector data, analogous to a `Vec``.
 pub trait VectorStore {
     /// Type of the underlying vector data.
     type Vector;
+    type VectorIter<'v>: Iterator<Item = &'v Self::Vector>
+    where
+        Self: 'v;
 
     /// Obtain a reference to the contents of the vector by VectorId.
-    /// *Panics* if `ord`` is out of bounds.
-    fn get(&self, ord: VectorId) -> &Self::Vector;
+    /// *Panics* if `i`` is out of bounds.
+    fn get(&self, i: usize) -> &Self::Vector;
+
+    fn vector_iter(&self) -> Self::VectorIter<'_>;
 
     /// Compute the mean point from the data set.
     fn compute_mean(&self) -> Self::Vector;
 
     /// Uses `scorer` to find the point nearest to `point` or `None` if the
     /// store is empty.
-    fn find_nearest_point<S>(&self, point: &Self::Vector, scorer: &S) -> Option<VectorId>
+    fn find_nearest_point<S>(&self, point: &Self::Vector, scorer: &S) -> Option<usize>
     where
         S: Scorer<Vector = Self::Vector>;
 
@@ -53,12 +52,12 @@ pub trait Scorer {
 /// Information about a neighbor of a node.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Neighbor {
-    id: VectorId,
+    id: u32,
     score: NotNan<f32>,
 }
 
-impl From<(VectorId, NotNan<f32>)> for Neighbor {
-    fn from(value: (VectorId, NotNan<f32>)) -> Self {
+impl From<(u32, NotNan<f32>)> for Neighbor {
+    fn from(value: (u32, NotNan<f32>)) -> Self {
         Self {
             id: value.0,
             score: value.1,
@@ -83,14 +82,14 @@ impl PartialOrd for Neighbor {
 
 /// Graph access.
 pub trait Graph {
-    type NeighborOrdIterator<'c>: Iterator<Item = VectorId>
+    type NeighborOrdIterator<'c>: Iterator<Item = usize>
     where
         Self: 'c;
 
     // Returns the entry point to the graph if any nodes have been populated.
-    fn entry_point(&self) -> Option<VectorId>;
+    fn entry_point(&self) -> Option<usize>;
     /// Return an iterate over the list of nodes neighboring `ord`.
-    fn neighbors_iter<'c>(&'c self, ord: VectorId) -> Self::NeighborOrdIterator<'c>;
+    fn neighbors_iter(&self, i: usize) -> Self::NeighborOrdIterator<'_>;
     /// Return the number of nodes in the graph.
     fn len(&self) -> usize;
 }
@@ -100,7 +99,7 @@ pub struct GraphSearcher {
     k: NonZeroUsize,
     candidates: BinaryHeap<Reverse<Neighbor>>,
     results: BinaryHeap<Neighbor>,
-    seen: HashSet<VectorId>,
+    seen: HashSet<usize>,
     visited: Vec<Neighbor>,
 }
 
@@ -145,7 +144,7 @@ impl GraphSearcher {
         S: Scorer<Vector = Q>,
     {
         self.search_internal(graph, store, query, scorer, true);
-        self.visited.sort_by(|a, b| a.cmp(b));
+        self.visited.sort();
     }
 
     fn search_internal<G, V, Q, S>(
@@ -160,11 +159,14 @@ impl GraphSearcher {
         V: VectorStore<Vector = Q>,
         S: Scorer<Vector = Q>,
     {
-        // XXX exit cleanly if the graph is empty.
+        if graph.entry_point().is_none() {
+            return;
+        }
         let entry_point = graph.entry_point().unwrap();
         let score = scorer.score(query, store.get(entry_point));
         self.seen.insert(entry_point);
-        self.candidates.push(Reverse((entry_point, score).into()));
+        self.candidates
+            .push(Reverse((entry_point as u32, score).into()));
 
         while let Some(Reverse(candidate)) = self.candidates.pop() {
             if !self.collect(candidate) {
@@ -174,14 +176,14 @@ impl GraphSearcher {
                 self.visited.push(candidate);
             }
 
-            for neighbor_id in graph.neighbors_iter(candidate.id) {
+            for neighbor_id in graph.neighbors_iter(candidate.id as usize) {
                 // skip candidates we've already visited.
                 if !self.seen.insert(neighbor_id) {
                     continue;
                 }
 
                 let score = scorer.score(query, store.get(neighbor_id));
-                let neighbor = Neighbor::from((neighbor_id, score));
+                let neighbor = Neighbor::from((neighbor_id as u32, score));
                 // Insert only neighbors that could possibly make it to the result set.
                 // XXX this makes the candidates heap ~unbounded.
                 // if we use a min-max heap here we could bound the size of the heap.
@@ -256,6 +258,7 @@ where
         store: &'a V,
         scorer: S,
     ) -> Self {
+        u32::try_from(store.len()).expect("ordinal count limited to 32 bits");
         Self {
             max_degree: max_degree.into(),
             alpha,
@@ -276,16 +279,17 @@ where
             self.add_node(mediod);
         }
         for i in 0..self.store.len() {
-            self.add_node(VectorId(i as u32));
+            self.add_node(i);
         }
     }
 
     /// Add a single vector from the backing store.
     ///
     /// *Panics* if `node` is out of range.
-    pub fn add_node(&mut self, node: VectorId) {
+    pub fn add_node(&mut self, node: usize) {
+        assert!(node < self.store.len());
         if self.graph.entry_point.is_none() {
-            self.graph.entry_point = Some(node);
+            self.graph.entry_point = Some(node as u32);
             return;
         }
 
@@ -305,11 +309,11 @@ where
         for n in neighbors {
             if self
                 .graph
-                .add_neighbor(n.id, Neighbor::from((node, n.score)))
+                .add_neighbor(n.id as usize, Neighbor::from((node as u32, n.score)))
             {
-                self.graph.sort_neighbors(n.id);
-                let pruned = self.robust_prune(self.graph.get_neighbors(n.id));
-                self.graph.set_neighbors(n.id, &pruned);
+                self.graph.sort_neighbors(n.id as usize);
+                let pruned = self.robust_prune(self.graph.get_neighbors(n.id as usize));
+                self.graph.set_neighbors(n.id as usize, &pruned);
             }
         }
     }
@@ -321,7 +325,7 @@ where
     }
 
     fn prune_all(&mut self) {
-        for id in (0..self.graph.len()).map(|i| VectorId(i as u32)) {
+        for id in 0..self.graph.len() {
             let neighbors = self.graph.get_neighbors(id);
             if neighbors.len() > self.max_degree {
                 self.graph.sort_neighbors(id);
@@ -358,7 +362,7 @@ where
                     // values. This might still need tuning.
                     let score_n_o = self
                         .scorer
-                        .score(self.store.get(n.id), self.store.get(o.id));
+                        .score(self.store.get(n.id as usize), self.store.get(o.id as usize));
                     prune_factor[j] = prune_factor[j].max(score_n_o / o.score)
                 }
             }
@@ -370,7 +374,7 @@ where
 
 #[derive(Clone, Debug)]
 pub struct MutableGraph {
-    entry_point: Option<VectorId>,
+    entry_point: Option<u32>,
     nodes: Vec<Vec<Neighbor>>,
     edges: usize,
 }
@@ -384,23 +388,23 @@ impl MutableGraph {
         }
     }
 
-    fn get_neighbors(&self, node: VectorId) -> &[Neighbor] {
-        &self.nodes[node.0 as usize]
+    fn get_neighbors(&self, node: usize) -> &[Neighbor] {
+        &self.nodes[node]
     }
 
-    fn sort_neighbors(&mut self, node: VectorId) {
-        self.nodes[node.0 as usize].sort();
+    fn sort_neighbors(&mut self, node: usize) {
+        self.nodes[node].sort();
     }
 
-    fn add_neighbor(&mut self, node: VectorId, neighbor: Neighbor) -> bool {
-        let node = &mut self.nodes[node.0 as usize];
+    fn add_neighbor(&mut self, node: usize, neighbor: Neighbor) -> bool {
+        let node = &mut self.nodes[node];
         node.push(neighbor);
         self.edges += 1;
         node.len() == node.capacity()
     }
 
-    fn set_neighbors(&mut self, node: VectorId, neighbors: &[Neighbor]) {
-        let node = &mut self.nodes[node.0 as usize];
+    fn set_neighbors(&mut self, node: usize, neighbors: &[Neighbor]) {
+        let node = &mut self.nodes[node];
         self.edges += neighbors.len();
         self.edges -= node.len();
         node.clear();
@@ -421,22 +425,22 @@ impl<'a> NeighborNodeIterator<'a> {
 }
 
 impl<'a> Iterator for NeighborNodeIterator<'a> {
-    type Item = VectorId;
+    type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.it.next().map(|x| x.id)
+        self.it.next().map(|x| x.id as usize)
     }
 }
 
 impl Graph for MutableGraph {
     type NeighborOrdIterator<'c> = NeighborNodeIterator<'c> where Self: 'c;
 
-    fn entry_point(&self) -> Option<VectorId> {
-        self.entry_point
+    fn entry_point(&self) -> Option<usize> {
+        self.entry_point.map(|p| p as usize)
     }
 
-    fn neighbors_iter<'c>(&'c self, ord: VectorId) -> Self::NeighborOrdIterator<'c> {
-        NeighborNodeIterator::new(&self.nodes[ord.0 as usize])
+    fn neighbors_iter(&self, ord: usize) -> Self::NeighborOrdIterator<'_> {
+        NeighborNodeIterator::new(&self.nodes[ord])
     }
 
     fn len(&self) -> usize {
@@ -452,15 +456,18 @@ mod test {
 
     use crate::vamana::Graph;
 
-    use super::{
-        GraphBuilder, GraphSearcher, MutableGraph, Neighbor, Scorer, VectorId, VectorStore,
-    };
+    use super::{GraphBuilder, GraphSearcher, MutableGraph, Neighbor, Scorer, VectorStore};
 
     impl VectorStore for Vec<u64> {
         type Vector = u64;
+        type VectorIter<'v> = std::slice::Iter<'v, Self::Vector>;
 
-        fn get(&self, ord: VectorId) -> &Self::Vector {
-            &self[ord.0 as usize]
+        fn get(&self, i: usize) -> &Self::Vector {
+            &self[i]
+        }
+
+        fn vector_iter<'v>(&'v self) -> Self::VectorIter<'v> {
+            self.iter()
         }
 
         fn compute_mean(&self) -> Self::Vector {
@@ -486,15 +493,15 @@ mod test {
             mean
         }
 
-        fn find_nearest_point<S>(&self, point: &Self::Vector, scorer: &S) -> Option<VectorId>
+        fn find_nearest_point<S>(&self, point: &Self::Vector, scorer: &S) -> Option<usize>
         where
             S: Scorer<Vector = Self::Vector>,
         {
             self.iter()
                 .enumerate()
-                .map(|(i, v)| Neighbor::from((VectorId(i as u32), scorer.score(point, v))))
+                .map(|(i, v)| Neighbor::from((i as u32, scorer.score(point, v))))
                 .min()
-                .map(|n| n.id)
+                .map(|n| n.id as usize)
         }
 
         fn len(&self) -> usize {
@@ -526,8 +533,8 @@ mod test {
         )
     }
 
-    fn get_neighbors(graph: &impl Graph, node: VectorId) -> Vec<u32> {
-        let mut edges: Vec<u32> = graph.neighbors_iter(node).map(|n| n.0).collect();
+    fn get_neighbors(graph: &impl Graph, node: usize) -> Vec<usize> {
+        let mut edges: Vec<usize> = graph.neighbors_iter(node).collect();
         edges.sort();
         edges
     }
@@ -556,10 +563,10 @@ mod test {
     fn single_node() {
         let store: Vec<u64> = vec![0, 1, 2, 3];
         let mut builder = make_builder(&store);
-        builder.add_node(VectorId(2));
+        builder.add_node(2);
         let graph: MutableGraph = builder.finish();
         assert_eq!(graph.len(), 4);
-        assert_eq!(graph.entry_point(), Some(VectorId(2)));
+        assert_eq!(graph.entry_point(), Some(2));
     }
 
     #[test]
@@ -569,12 +576,12 @@ mod test {
         builder.add_all_vectors();
         let graph: MutableGraph = builder.finish();
         assert_eq!(graph.len(), 5);
-        assert_eq!(graph.entry_point(), Some(VectorId(1)));
-        assert_eq!(get_neighbors(&graph, VectorId(0)), vec![1u32, 2, 3, 4]);
-        assert_eq!(get_neighbors(&graph, VectorId(1)), vec![0u32, 2, 3, 4]);
-        assert_eq!(get_neighbors(&graph, VectorId(2)), vec![0u32, 1, 3, 4]);
-        assert_eq!(get_neighbors(&graph, VectorId(3)), vec![0u32, 1, 2, 4]);
-        assert_eq!(get_neighbors(&graph, VectorId(4)), vec![0u32, 1, 2, 3]);
+        assert_eq!(graph.entry_point(), Some(1));
+        assert_eq!(get_neighbors(&graph, 0), vec![1, 2, 3, 4]);
+        assert_eq!(get_neighbors(&graph, 1), vec![0, 2, 3, 4]);
+        assert_eq!(get_neighbors(&graph, 2), vec![0, 1, 3, 4]);
+        assert_eq!(get_neighbors(&graph, 3), vec![0, 1, 2, 4]);
+        assert_eq!(get_neighbors(&graph, 4), vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -583,10 +590,10 @@ mod test {
         let mut builder = make_builder(&store);
         builder.add_all_vectors();
         let graph: MutableGraph = builder.finish();
-        assert_eq!(get_neighbors(&graph, VectorId(0)), vec![1u32, 2, 4, 8]);
-        assert_eq!(get_neighbors(&graph, VectorId(7)), vec![3u32, 5, 6, 15]);
-        assert_eq!(get_neighbors(&graph, VectorId(8)), vec![0u32, 9, 10, 12]);
-        assert_eq!(get_neighbors(&graph, VectorId(15)), vec![7u32, 11, 13, 14]);
+        assert_eq!(get_neighbors(&graph, 0), vec![1, 2, 4, 8]);
+        assert_eq!(get_neighbors(&graph, 7), vec![3, 5, 6, 15]);
+        assert_eq!(get_neighbors(&graph, 8), vec![0, 9, 10, 12]);
+        assert_eq!(get_neighbors(&graph, 15), vec![7, 11, 13, 14]);
     }
 
     #[test]
@@ -600,7 +607,7 @@ mod test {
         assert_eq!(
             results
                 .into_iter()
-                .map(|n| (n.id.0 as usize, n.score.into_inner()))
+                .map(|n| (n.id, n.score.into_inner()))
                 .collect::<Vec<_>>(),
             vec![
                 (0, 0.984375),
