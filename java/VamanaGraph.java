@@ -91,15 +91,18 @@ public class VamanaGraph {
         // Entry point to the graph is chosen arbitrarily.
         Node startNode = this.nodes.get(0);
 
-        // initialize sets resultSet ← {startNode} and visitedSet ← {}
-        // while resultSet - visitedSet != {} do
-        // let point ← r where r has min distance(query, r) for all r in (resultSet -
-        // visitedSet)
-        // resultSet.addAll(point.edges)
-        // visitedSet.add(point)
-        // if resultSet.size > searchListSize then
-        // update resultSet to retain closest searchListSize points to query
-        // return [closest k points from resultSet; visitedSet]
+        /**
+         * <code>
+         * initialize sets resultSet ← {startNode} and visitedSet ← {}
+         * while resultSet - visitedSet != {} do
+         *   let point ← r where r has min distance(query, r) for all r in (resultSet - visitedSet)
+         *   resultSet.addAll(point.edges)
+         *   visitedSet.add(point)
+         *   if resultSet.size > searchListSize then
+         *     update resultSet to retain closest searchListSize points to query
+         * return [closest k points from resultSet; visitedSet]
+         * </code>
+         */
 
         throw new UnsupportedOperationException("unimplemented");
     }
@@ -132,16 +135,20 @@ public class VamanaGraph {
             return;
         }
 
-        // visitedSet ← node.edges
-        // node.edges = {}
-        // while visitedSet != {} do
-        // q ← r where r has min distance(node, r) for all r in visitedSet
-        // node.edges.add(q)
-        // if node.edges.size() == maxDegree then
-        // break
-        // for r in visitedSet do
-        // if α · distance(r, q) ≤ distance(node, q) then
-        // remove r from V
+        /**
+         * <code>
+         * visitedSet ← node.edges
+         * node.edges = {}
+         * while visitedSet != {} do
+         *   q ← r where r has min distance(node, r) for all r in visitedSet
+         *   node.edges.add(q)
+         *   if node.edges.size() == maxDegree then
+         *     break
+         *   for r in visitedSet do
+         *     if α · distance(r, q) ≤ distance(node, q) then
+         *       remove r from V
+         * </code>
+         */
 
         throw new UnsupportedOperationException("unimplemented");
     }
