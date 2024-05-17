@@ -4,23 +4,19 @@ mod vamana;
 mod vec;
 
 use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
-    fs::File,
-    io::BufWriter,
-    num::NonZeroUsize,
-    path::PathBuf,
-    str::FromStr,
+    cmp::Reverse, collections::BinaryHeap, fs::File, io::BufWriter, num::NonZeroUsize,
+    path::PathBuf, str::FromStr,
 };
 
 use clap::{Args, Parser, Subcommand};
-use hnsw::{Hnsw, Searcher};
+use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
-use rand_pcg::Pcg64;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use serde::Serialize;
-use space::{Metric, Neighbor};
+use simsimd::BinarySimilarity;
+use vamana::Scorer;
 use vec::{BinaryVectorView, FloatVectorView, VectorView, VectorViewStore};
+
+use crate::vamana::GraphBuilder;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -48,10 +44,8 @@ enum Commands {
     },
     /// Search an input vector file using queries from another file.
     Search(SearchArgs),
-    /// Analyze binary vector data.
-    Analyze(AnalyzerArgs),
-    /// Build an HNSW index of random vectors from a binary query file.
-    BuildCentroidIndex(BuildCentroidIndex),
+    /// Build a Vamana vector index from an input flat vector file.
+    VamanaBuild(VamanaBuildArgs),
 }
 
 #[derive(Args)]
@@ -84,46 +78,34 @@ struct SearchArgs {
 }
 
 #[derive(Args)]
-struct AnalyzerArgs {
-    /// Path to flat vector file.
+struct VamanaBuildArgs {
+    /// Path to the input flat vector file.
     #[arg(short, long)]
-    binary_vectors: PathBuf,
-    /// Number of dimensions in input vectors.
+    vectors: PathBuf,
+    /// Coding of vectors in input flat vector file.
     #[arg(short, long)]
-    dimensions: NonZeroUsize,
-    /// Distribution of population count of each input vector.
-    #[arg(short, long, default_value_t = false)]
-    popcnt: bool,
-    /// Distribution of vectors with a particular bit set.
-    #[arg(short, long, default_value_t = false)]
-    set_dist: bool,
-    /// Distribution of the first word of various sizes.
-    #[arg(short, long, default_value_t = false)]
-    word_dist: bool,
-    /// Distribution of closest centroids.
-    #[arg(short, long, default_value_t = false)]
-    rand_centroids: bool,
-}
-
-#[derive(Args)]
-struct BuildCentroidIndex {
-    /// Path to flat binary vector file to use as input.
-    #[arg(short, long)]
-    binary_vectors: PathBuf,
-    /// Number of dimensions in input vectors.
+    coding: VectorCoding,
+    // Number of dimensions in input vectors.
     #[arg(short, long)]
     dimensions: NonZeroUsize,
-    /// Path to output index file.
+    /// Path to output vamana index file.
     #[arg(short, long)]
-    index: PathBuf,
-    /// Fraction of input vector to select for the index.
-    #[arg(short, long)]
-    frac: f64,
+    index_file: PathBuf,
+    /// Maximum degree of each vertex in the vamana graph.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(32).unwrap())]
+    max_degree: NonZeroUsize,
+    /// Beam width for search during index build.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(200).unwrap())]
+    beam_width: NonZeroUsize,
+    /// Alpha value for pruning; must be >= 1.0
+    #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
+    alpha: NotNan<f32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VectorCoding {
     F32,
+    Bin,
 }
 
 impl FromStr for VectorCoding {
@@ -131,6 +113,7 @@ impl FromStr for VectorCoding {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "f32" => Ok(VectorCoding::F32),
+            "bin" => Ok(VectorCoding::Bin),
             _ => Err("unknown vector coding format"),
         }
     }
@@ -279,167 +262,82 @@ fn search_queries<'a>(
     }
 }
 
-#[derive(Serialize)]
-struct Hamming;
+struct BinaryVectorStore<'a> {
+    vector_data: &'a [u8],
+    stride: usize,
+}
 
-impl<'a> Metric<BinaryVectorView<'a>> for Hamming {
-    type Unit = u32;
+impl<'a> BinaryVectorStore<'a> {
+    fn new(vector_data: &'a [u8], dimensions: NonZeroUsize) -> Self {
+        let stride = (dimensions.get() + 7) / 8;
+        assert_eq!(vector_data.len() % stride, 0);
+        Self {
+            vector_data,
+            stride,
+        }
+    }
 
-    fn distance(&self, a: &BinaryVectorView<'a>, b: &BinaryVectorView<'a>) -> Self::Unit {
-        a.distance(b)
+    fn len(&self) -> usize {
+        self.vector_data.len() / self.stride
     }
 }
 
-fn analyze(args: AnalyzerArgs) -> std::io::Result<()> {
-    let bin_vector_backing = unsafe { memmap2::Mmap::map(&File::open(args.binary_vectors)?)? };
-    let bin_vector_store = vec::VectorViewStore::<'_, BinaryVectorView<'_>>::new(
-        bin_vector_backing.as_ref(),
-        args.dimensions.get(),
-    );
+// rayon par_chunks(n) is probably what I want for parallel processing.
+// i'm not entirely sure how i model concurrent build. i guess i could internalize it?
+// if I do that i don't need par_chunks, i can just use a parallel range iterator and then I have
+// to wrap node state in a Mutex
+impl<'a> vamana::VectorStore for BinaryVectorStore<'a> {
+    // XXX this is kind of awkward. I don't know if this is a good idea.
+    type Vector = [u8];
 
-    if args.popcnt {
-        // This produces a bell curve around the center of the dimensionality.
-        let mut count_dist = Vec::with_capacity(args.dimensions.get() + 1);
-        count_dist.resize(args.dimensions.get() + 1, 0usize);
-        for v in bin_vector_store.iter() {
-            count_dist[v.count_ones() as usize] += 1;
-        }
-        for (i, c) in count_dist.into_iter().enumerate().filter(|(_, c)| c > &0) {
-            println!("{:4} {}", i, c);
-        }
+    fn get(&self, i: usize) -> &Self::Vector {
+        let offset = i * self.stride;
+        &self.vector_data[offset..(offset + self.stride)]
     }
 
-    if args.set_dist {
-        // Some values occur very infrequently but most are 45-55%
-        let mut set_dist = Vec::with_capacity(args.dimensions.get() + 1);
-        set_dist.resize(args.dimensions.get() + 1, 0usize);
-        for v in bin_vector_store.iter() {
-            for b in v.ones_iter() {
-                set_dist[b] += 1;
-            }
-        }
-        for (i, p) in set_dist
-            .into_iter()
-            .enumerate()
-            .filter(|(_, c)| c > &0)
-            .map(|(i, c)| (i, c as f64 * 100f64 / bin_vector_store.len() as f64))
-        {
-            println!("{:4} {:.2}%", i, p);
-        }
+    fn len(&self) -> usize {
+        self.vector_data.len() / self.stride
     }
-
-    if args.word_dist {
-        // Vector words aren't super random, the data set is ~1M but 2^20 bits only covers a quarter
-        // of this or so. At 16 bits it divides the space roughly in half. At 12 bits it covers most of
-        // the space, at 8 bits it covers everything.
-        // If I do LSH with 16 I end up with 96 different "hash functions" I have to perform a lookup
-        // in, which seems prohibitive if I am a completionist. Double the hash size and I only do
-        // 48 posting lookups but each one should have only one result.
-        let mut h8 = HashSet::new();
-        let mut h12 = HashSet::new();
-        let mut h16 = HashSet::new();
-        let mut h20 = HashSet::new();
-        let mut h24 = HashSet::new();
-        let mut h28 = HashSet::new();
-        let mut h32 = HashSet::new();
-        for v in bin_vector_store.iter() {
-            let w0 = v.word_iter().next().unwrap();
-            h8.insert(w0 & 0xff);
-            h12.insert(w0 & 0xfff);
-            h16.insert(w0 & 0xffff);
-            h20.insert(w0 & 0xffff_f);
-            h24.insert(w0 & 0xffff_ff);
-            h28.insert(w0 & 0xffff_fff);
-            h32.insert(w0 & 0xffff_ffff);
-        }
-        println!("h8  {}", h8.len());
-        println!("h12 {}", h12.len());
-        println!("h16 {}", h16.len());
-        println!("h20 {}", h20.len());
-        println!("h24 {}", h24.len());
-        println!("h28 {}", h28.len());
-        println!("h32 {}", h32.len());
-    }
-
-    if args.rand_centroids {
-        // XXX I can probably revert almost everything I'm just getting a version mismatch since
-        // hnsw doesn't re-export space::Metric
-        let mut hnsw: Hnsw<Hamming, BinaryVectorView, Pcg64, 12, 24> = Hnsw::new(Hamming);
-        let mut searcher = Searcher::default();
-        println!("building hnsw index");
-        for (i, v) in bin_vector_store
-            .iter()
-            .filter(|v| v.hash() % 6 == 0)
-            .enumerate()
-        {
-            if i % 10000 == 0 {
-                println!("{}", i);
-            }
-            hnsw.insert(v, &mut searcher);
-        }
-        println!("done building hnsw index");
-        let closest_centroids: Vec<usize> = (0..bin_vector_store.len())
-            .into_par_iter()
-            .map(|i| {
-                let p = bin_vector_store.get(i);
-                let mut searcher = Searcher::default();
-                let mut closest = [Neighbor {
-                    index: 0usize,
-                    distance: 0u32,
-                }; 1];
-                hnsw.nearest(&p, 25, &mut searcher, &mut closest);
-                closest[0].index
-            })
-            .collect();
-        let mut centroid_counts: HashMap<usize, usize> = HashMap::new();
-        for c in closest_centroids {
-            centroid_counts
-                .entry(c)
-                .and_modify(|n| *n += 1)
-                .or_insert(1);
-        }
-        let mut pl_lengths: BTreeMap<usize, usize> = BTreeMap::new();
-        for v in centroid_counts.values() {
-            pl_lengths.entry(*v).and_modify(|n| *n += 1).or_insert(1);
-        }
-        let num_pls: usize = pl_lengths.values().sum();
-        let mut total = 0usize;
-        for (l, c) in pl_lengths {
-            total += c;
-            println!(
-                "{:3} {:7} {:.2}%",
-                l,
-                c,
-                total as f64 * 100.0 / num_pls as f64
-            );
-        }
-    }
-
-    Ok(())
 }
 
-fn build_centroid_index(args: BuildCentroidIndex) -> std::io::Result<()> {
-    let bin_vector_backing = unsafe { memmap2::Mmap::map(&File::open(args.binary_vectors)?)? };
-    let bin_vector_store = vec::VectorViewStore::<'_, BinaryVectorView<'_>>::new(
-        bin_vector_backing.as_ref(),
-        args.dimensions.get(),
-    );
-    let max_hash = u64::MAX / 1000 * ((args.frac * 1000.0) as u64);
-    let mut hnsw: Hnsw<Hamming, BinaryVectorView, Pcg64, 12, 24> = Hnsw::new(Hamming);
-    let mut searcher = Searcher::default();
-    for (i, v) in bin_vector_store
-        .iter()
-        .filter(|v| v.hash() <= max_hash)
-        .enumerate()
-    {
-        if i % 10000 == 0 {
-            println!("{}", i);
-        }
-        hnsw.insert(v, &mut searcher);
-    }
+struct HammingScorer;
 
-    let mut w = BufWriter::new(File::create(args.index)?);
-    rmp_serde::encode::write(&mut w, &hnsw).unwrap();
+impl Scorer for HammingScorer {
+    type Vector = [u8];
+
+    fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32> {
+        let dim = (a.len() * 8) as f32;
+        let distance = BinarySimilarity::hamming(a, b).unwrap() as f32;
+        NotNan::new((dim - distance) / dim).unwrap()
+    }
+}
+
+fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
+    assert_eq!(args.coding, VectorCoding::Bin);
+    let vectors_in = unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? };
+    let store = BinaryVectorStore::new(&vectors_in, args.dimensions);
+    let builder = GraphBuilder::new(
+        args.max_degree,
+        args.beam_width,
+        *args.alpha,
+        &store,
+        HammingScorer,
+    );
+    let progress = ProgressBar::new(store.len() as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template("{wide_bar} {pos}/{len} ETA: {eta_precise} Elapsed: {elapsed_precise}")
+                .unwrap(),
+        )
+        .with_finish(indicatif::ProgressFinish::AndLeave);
+    (0..store.len()).into_par_iter().for_each(|i| {
+        builder.add_node(i);
+        progress.inc(1);
+    });
+    let graph = builder.finish();
+    progress.finish_using_style();
+    let mut w = BufWriter::new(File::create(args.index_file)?);
+    graph.write(&mut w)?;
     Ok(())
 }
 
@@ -453,7 +351,6 @@ fn main() -> std::io::Result<()> {
             dimensions,
         } => binary_quantize(vectors, output, dimensions),
         Commands::Search(args) => search(args),
-        Commands::Analyze(args) => analyze(args),
-        Commands::BuildCentroidIndex(args) => build_centroid_index(args),
+        Commands::VamanaBuild(args) => vamana_build(args),
     }
 }

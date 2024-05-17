@@ -1,53 +1,55 @@
 // XXX filtered search
-// the idea is that we can use multiple (random) entry points to the graph to seed the candidate
-// list, where the number of candidates is between 1/f and num_candidates/f. We would apply the
-// filter before we traverse any nodes. if the distribution is roughly random across edges we'd
-// expect to search the same number of nodes. We would use the same result set size but increase
-// the size of the candidates heap proportionally to avoid dropping stuff.
+//
+// we want to avoid scoring a lot of stuff we can't collect.
+// * read edges of candidates and filter.
+// * if there are too few neighbors (none?) automatically traverse neighbors-of-neighbors.
+// * get greedy: insert edges that don't match the filter at a very low or partial score.
+// * use a much longer candidate list.
+// * choose an arbitrary entrypoint if the preset one cannot be used?
 
-use core::num;
 use std::{
+    cell::RefCell,
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::BinaryHeap,
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        RwLock, RwLockReadGuard,
+    },
 };
 
+use ahash::AHashSet;
+use crossbeam_skiplist::SkipSet;
 use ordered_float::NotNan;
+use rayon::{
+    current_num_threads,
+    iter::{IntoParallelIterator, ParallelIterator},
+};
+use thread_local::ThreadLocal;
 
 /// Dense store of vector data, analogous to a `Vec``.
 pub trait VectorStore {
     /// Type of the underlying vector data.
-    type Vector;
-    type VectorIter<'v>: Iterator<Item = &'v Self::Vector>
-    where
-        Self: 'v;
+    type Vector: ?Sized;
 
     /// Obtain a reference to the contents of the vector by VectorId.
     /// *Panics* if `i`` is out of bounds.
     fn get(&self, i: usize) -> &Self::Vector;
 
-    /// Obtain an iterator over vector data.
-    fn vector_iter(&self) -> Self::VectorIter<'_>;
-
-    /// Compute the mean point from the data set.
-    fn compute_mean(&self) -> Self::Vector;
-
-    /// Uses `scorer` to find the point nearest to `point` or `None` if the
-    /// store is empty.
-    fn find_nearest_point<S>(&self, point: &Self::Vector, scorer: &S) -> Option<usize>
-    where
-        S: Scorer<Vector = Self::Vector>;
+    // XXX method to approximate centroid. would compute this value up front when building the
+    // graph and periodically search to improve entry point.
 
     /// Return the total number of vectors in the store.
     fn len(&self) -> usize;
 }
 
 /// Trait for scoring vectors against one another.
+// XXX maybe the args shouldn't be by ref so the vector type doesn't have to be unref slice?
 pub trait Scorer {
     /// Type for the underlying vector data.
-    type Vector;
+    type Vector: ?Sized;
 
     /// Return the non-nan score of the two vectors. Larger values are better.
     fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32>;
@@ -98,12 +100,12 @@ pub trait Graph {
     fn len(&self) -> usize;
 }
 
-// XXX should this be public?
+#[derive(Debug)]
 pub struct GraphSearcher {
     k: NonZeroUsize,
     candidates: BinaryHeap<Reverse<Neighbor>>,
     results: BinaryHeap<Neighbor>,
-    seen: HashSet<usize>,
+    seen: AHashSet<usize>,
     visited: Vec<Neighbor>,
 }
 
@@ -114,7 +116,7 @@ impl GraphSearcher {
             k,
             candidates: BinaryHeap::with_capacity(k.into()),
             results: BinaryHeap::with_capacity(k.into()),
-            seen: HashSet::new(),
+            seen: AHashSet::new(),
             visited: vec![],
         }
     }
@@ -141,8 +143,13 @@ impl GraphSearcher {
 
     /// Search `graph` over vector `store` for `query` using `scorer` to compute scores.
     /// Access visited to view results in descending order by score.
-    fn search_for_insertion<G, V, Q, S>(&mut self, graph: &G, store: &V, query: &Q, scorer: &S)
-    where
+    fn search_for_insertion<G, V, Q: ?Sized, S>(
+        &mut self,
+        graph: &G,
+        store: &V,
+        query: &Q,
+        scorer: &S,
+    ) where
         G: Graph,
         V: VectorStore<Vector = Q>,
         S: Scorer<Vector = Q>,
@@ -151,7 +158,7 @@ impl GraphSearcher {
         self.visited.sort();
     }
 
-    fn search_internal<G, V, Q, S>(
+    fn search_internal<G, V, Q: ?Sized, S>(
         &mut self,
         graph: &G,
         store: &V,
@@ -232,18 +239,20 @@ impl GraphSearcher {
 /// `GraphBuilder` is used to build a vamana graph.
 pub struct GraphBuilder<'a, V, S> {
     max_degree: usize,
+    beam_width: NonZeroUsize,
     alpha: f32,
     store: &'a V,
     scorer: S,
 
     graph: MutableGraph,
-    searcher: GraphSearcher,
+    searcher: ThreadLocal<RefCell<GraphSearcher>>,
+    in_flight: SkipSet<u32>,
 }
 
 impl<'a, V, S> GraphBuilder<'a, V, S>
 where
-    V: VectorStore,
-    S: Scorer<Vector = V::Vector>,
+    V: VectorStore + Sync + Send,
+    S: Scorer<Vector = V::Vector> + Sync + Send,
 {
     /// Create a new graph builder.
     ///
@@ -265,78 +274,71 @@ where
         u32::try_from(store.len()).expect("ordinal count limited to 32 bits");
         Self {
             max_degree: max_degree.into(),
+            beam_width,
             alpha,
             store,
             scorer,
             graph: MutableGraph::new(store.len(), max_degree),
-            searcher: GraphSearcher::new(beam_width),
+            searcher: ThreadLocal::with_capacity(current_num_threads()),
+            in_flight: SkipSet::new(),
         }
     }
 
     /// Add all vectors from the backing store.
-    pub fn add_all_vectors(&mut self) {
-        // Choose a good entry point and add it first.
-        if let Some(mediod) = self
-            .store
-            .find_nearest_point(&self.store.compute_mean(), &self.scorer)
-        {
-            self.add_node(mediod);
-        }
-        for i in 0..self.store.len() {
+    fn add_all_vectors(&self) {
+        (0..self.store.len()).into_par_iter().for_each(|i| {
             self.add_node(i);
-        }
+        });
     }
 
     /// Add a single vector from the backing store.
     ///
     /// *Panics* if `node` is out of range.
-    pub fn add_node(&mut self, node: usize) {
+    pub fn add_node(&self, node: usize) {
         assert!(node < self.store.len());
-        if self.graph.entry_point.is_none() {
-            self.graph.entry_point = Some(node as u32);
+        if self.graph.try_set_entry_point(node) {
             return;
         }
 
-        if !self.graph.get_neighbors(node).is_empty() {
-            return;
+        let mut searcher = self
+            .searcher
+            .get_or(|| RefCell::new(GraphSearcher::new(self.beam_width)))
+            .borrow_mut();
+        searcher.clear();
+        // Update the set of in-flight nodes to include this one. All in-flight nodes will be added
+        // to the visited set to ensure we generate links.
+        let query = self.store.get(node);
+        for n in self.in_flight.iter() {
+            searcher.visited.push(Neighbor::from((
+                *n as u32,
+                self.scorer.score(query, self.store.get(*n as usize)),
+            )))
         }
-
-        self.searcher.clear();
-        self.searcher.search_for_insertion(
-            &self.graph,
-            self.store,
-            self.store.get(node),
-            &self.scorer,
-        );
-        let neighbors = self.robust_prune(&self.searcher.visited);
-        self.graph.set_neighbors(node, &neighbors);
+        self.in_flight.insert(node as u32);
+        searcher.search_for_insertion(&self.graph, self.store, query, &self.scorer);
+        searcher.visited.dedup();
+        searcher.visited.retain(|n| n.id as usize != node);
+        let neighbors = self.robust_prune(&searcher.visited);
+        self.graph
+            .insert_neighbors(node, &neighbors, |unpruned| self.robust_prune(unpruned));
         for n in neighbors {
-            if self
-                .graph
-                .add_neighbor(n.id as usize, Neighbor::from((node as u32, n.score)))
-            {
-                self.graph.sort_neighbors(n.id as usize);
-                let pruned = self.robust_prune(self.graph.get_neighbors(n.id as usize));
-                self.graph.set_neighbors(n.id as usize, &pruned);
-            }
+            self.graph.insert_neighbor(
+                n.id as usize,
+                Neighbor::from((node as u32, n.score)),
+                |unpruned| self.robust_prune(unpruned),
+            );
         }
+
+        self.in_flight.remove(&(node as u32));
     }
 
     /// Wraps up graph building and prepares for search.
-    pub fn finish(mut self) -> MutableGraph {
-        self.prune_all();
+    pub fn finish(self) -> MutableGraph {
+        (0..self.store.len()).into_par_iter().for_each(|i| {
+            self.graph
+                .maybe_prune_neighbors(i, |unpruned| self.robust_prune(unpruned))
+        });
         self.graph
-    }
-
-    fn prune_all(&mut self) {
-        for id in 0..self.graph.len() {
-            let neighbors = self.graph.get_neighbors(id);
-            if neighbors.len() > self.max_degree {
-                self.graph.sort_neighbors(id);
-                let pruned = self.robust_prune(self.graph.get_neighbors(id));
-                self.graph.set_neighbors(id, &pruned);
-            }
-        }
     }
 
     /// REQUIRES: neighbors is sorted in descending order by score.
@@ -346,7 +348,6 @@ where
         let mut pruned = Vec::with_capacity(self.max_degree);
         let mut cur_alpha = NotNan::new(1.0f32).expect("not NaN constant");
         let max_alpha = NotNan::new(self.alpha).expect("not NaN constant");
-        // XXX may want a list of alpha values intead of one and a multiplier.
         while cur_alpha <= max_alpha && pruned.len() < self.max_degree {
             for (i, n) in neighbors.iter().enumerate() {
                 if pruned.len() >= self.max_degree {
@@ -358,15 +359,14 @@ where
                 prune_factor[i] = NotNan::new(f32::MAX).unwrap();
                 pruned.push(*n);
                 // Update prune factor for all subsequent neighbors.
+                let n_vector = self.store.get(n.id as usize);
                 for (j, o) in neighbors.iter().enumerate().skip(i + 1) {
                     if prune_factor[j] > max_alpha {
                         continue;
                     }
                     // This inverts the order from the paper because score metrics favor larger
                     // values. This might still need tuning.
-                    let score_n_o = self
-                        .scorer
-                        .score(self.store.get(n.id as usize), self.store.get(o.id as usize));
+                    let score_n_o = self.scorer.score(n_vector, self.store.get(o.id as usize));
                     prune_factor[j] = prune_factor[j].max(score_n_o / o.score)
                 }
             }
@@ -376,55 +376,95 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MutableGraph {
-    entry_point: Option<u32>,
-    nodes: Vec<Vec<Neighbor>>,
+    max_degree: usize,
+    entry_point: AtomicUsize,
+    // XXX Vec<Neighbor> ought to be something else that applies an ordering constraint, probably
+    // just default neighbor ordering.
+    // XXX have all updates replace the values rather than updates in place and use crossbeam::epoch.
+    nodes: Vec<RwLock<Vec<Neighbor>>>,
 }
 
 impl MutableGraph {
     fn new(len: usize, max_degree: NonZeroUsize) -> Self {
+        let mut nodes = Vec::with_capacity(len);
+        nodes.resize_with(len, || {
+            RwLock::new(Vec::with_capacity(max_degree.get() * 2))
+        });
         Self {
-            entry_point: None,
-            nodes: vec![Vec::with_capacity(max_degree.get() * 2); len],
+            max_degree: max_degree.get(),
+            entry_point: AtomicUsize::new(usize::MAX),
+            nodes,
         }
     }
 
-    fn get_neighbors(&self, node: usize) -> &[Neighbor] {
-        &self.nodes[node]
+    fn try_set_entry_point(&self, node: usize) -> bool {
+        self.entry_point
+            .compare_exchange(usize::MAX, node, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
-    fn sort_neighbors(&mut self, node: usize) {
-        self.nodes[node].sort();
+    fn insert_neighbor<P>(&self, node: usize, neighbor: Neighbor, prune: P)
+    where
+        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+    {
+        let mut edges = self.nodes[node].write().unwrap();
+        assert_ne!(node, neighbor.id as usize);
+        if let Err(index) = edges.binary_search(&neighbor) {
+            edges.insert(index, neighbor);
+            if edges.len() >= edges.capacity() {
+                let pruned = prune(&edges);
+                edges.clear();
+                edges.extend_from_slice(&pruned);
+            }
+        }
     }
 
-    fn add_neighbor(&mut self, node: usize, neighbor: Neighbor) -> bool {
-        let node = &mut self.nodes[node];
-        node.push(neighbor);
-        node.len() == node.capacity()
+    fn insert_neighbors<P>(&self, node: usize, neighbors: &[Neighbor], prune: P)
+    where
+        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+    {
+        let mut edges = self.nodes[node].write().unwrap();
+        let cur = edges.clone();
+        edges.clear();
+        for n in itertools::kmerge(vec![&cur, neighbors].into_iter()) {
+            edges.push(*n);
+        }
+        if edges.len() >= edges.capacity() {
+            let pruned = prune(&edges);
+            edges.clear();
+            edges.extend_from_slice(&pruned);
+        }
     }
 
-    fn set_neighbors(&mut self, node: usize, neighbors: &[Neighbor]) {
-        let node = &mut self.nodes[node];
-        node.clear();
-        node.extend_from_slice(neighbors)
+    fn maybe_prune_neighbors<P>(&self, node: usize, prune: P)
+    where
+        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+    {
+        let mut edges = self.nodes[node].write().unwrap();
+        if edges.len() >= self.max_degree {
+            let pruned = prune(&edges);
+            edges.clear();
+            edges.extend_from_slice(&pruned);
+        }
     }
 
     pub fn write(&self, out: &mut impl Write) -> std::io::Result<()> {
         out.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
-        out.write_all(&(self.entry_point.unwrap_or(0) as u32).to_le_bytes())?;
+        out.write_all(&((self.entry_point.load(Ordering::Relaxed) as u32).to_le_bytes()))?;
         // Write the number of nodes at the start of each edge and at the end. This way we will
         // write self.nodes.len() + 1 values for edge extents.
         out.write_all(&0u64.to_le_bytes())?;
         // This is ~8MB per ~1M nodes
         let mut num_edges = 0u64;
-        for n in self.nodes.iter() {
+        for n in self.nodes.iter().map(|n| n.read().unwrap()) {
             num_edges += n.len() as u64;
             out.write_all(&num_edges.to_le_bytes())?;
         }
         // This is ~120MB per ~1M nodes. If we did simple bit-width compression it would be ~75MB.
-        for n in self.nodes.iter() {
-            for e in n {
+        for n in self.nodes.iter().map(|n| n.read().unwrap()) {
+            for e in n.iter() {
                 out.write_all(&e.id.to_le_bytes())?;
             }
         }
@@ -433,13 +473,15 @@ impl MutableGraph {
 }
 
 pub struct NeighborNodeIterator<'a> {
-    it: std::slice::Iter<'a, Neighbor>,
+    guard: RwLockReadGuard<'a, Vec<Neighbor>>,
+    next: usize,
 }
 
 impl<'a> NeighborNodeIterator<'a> {
-    fn new(neighbors: &'a [Neighbor]) -> Self {
+    fn new(neighbors: &'a RwLock<Vec<Neighbor>>) -> Self {
         Self {
-            it: neighbors.iter(),
+            guard: neighbors.read().unwrap(),
+            next: 0,
         }
     }
 }
@@ -448,11 +490,22 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.it.next().map(|x| x.id as usize)
+        if self.next >= self.guard.len() {
+            return None;
+        }
+
+        let i = self.next;
+        self.next += 1;
+        Some(self.guard[i].id as usize)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.it.size_hint()
+        let size = if self.next < self.guard.len() {
+            self.guard.len() - self.next
+        } else {
+            0
+        };
+        (size, Some(size))
     }
 }
 
@@ -464,7 +517,12 @@ impl Graph for MutableGraph {
     type NeighborEdgeIterator<'c> = NeighborNodeIterator<'c> where Self: 'c;
 
     fn entry_point(&self) -> Option<usize> {
-        self.entry_point.map(|p| p as usize)
+        let entry_point = self.entry_point.load(Ordering::Relaxed);
+        if entry_point != usize::MAX {
+            Some(entry_point)
+        } else {
+            None
+        }
     }
 
     fn neighbors_iter(&self, ord: usize) -> Self::NeighborEdgeIterator<'_> {
@@ -578,61 +636,21 @@ impl<'a> Graph for ImmutableMemoryGraph<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::{cmp::Ordering, num::NonZeroUsize};
+    use std::num::NonZeroUsize;
 
     use ordered_float::NotNan;
 
     use crate::vamana::Graph;
 
     use super::{
-        GraphBuilder, GraphSearcher, ImmutableMemoryGraph, MutableGraph, Neighbor, Scorer,
-        VectorStore,
+        GraphBuilder, GraphSearcher, ImmutableMemoryGraph, MutableGraph, Scorer, VectorStore,
     };
 
     impl VectorStore for Vec<u64> {
         type Vector = u64;
-        type VectorIter<'v> = std::slice::Iter<'v, Self::Vector>;
 
         fn get(&self, i: usize) -> &Self::Vector {
             &self[i]
-        }
-
-        fn vector_iter<'v>(&'v self) -> Self::VectorIter<'v> {
-            self.iter()
-        }
-
-        fn compute_mean(&self) -> Self::Vector {
-            let mut counts = [0usize; 64];
-            for mut v in self.iter().copied() {
-                while v != 0 {
-                    let i = v.trailing_zeros() as usize;
-                    counts[i] += 1;
-                    v ^= 1u64 << i;
-                }
-            }
-
-            let mean = counts
-                .into_iter()
-                .enumerate()
-                .filter(|(i, c)| match (*c as usize).cmp(&(self.len() / 2)) {
-                    Ordering::Less => false,
-                    Ordering::Greater => true,
-                    Ordering::Equal => i % 2 == 0,
-                })
-                .map(|(i, _)| 1u64 << i)
-                .fold(0u64, |m, x| m | x);
-            mean
-        }
-
-        fn find_nearest_point<S>(&self, point: &Self::Vector, scorer: &S) -> Option<usize>
-        where
-            S: Scorer<Vector = Self::Vector>,
-        {
-            self.iter()
-                .enumerate()
-                .map(|(i, v)| Neighbor::from((i as u32, scorer.score(point, v))))
-                .min()
-                .map(|n| n.id as usize)
         }
 
         fn len(&self) -> usize {
@@ -652,7 +670,7 @@ mod test {
         }
     }
 
-    fn make_builder<'a, V: VectorStore<Vector = u64>>(
+    fn make_builder<'a, V: VectorStore<Vector = u64> + Sync + Send>(
         store: &'a V,
     ) -> GraphBuilder<'a, V, Hamming64> {
         GraphBuilder::new(
@@ -673,9 +691,8 @@ mod test {
     #[test]
     fn empty_store_and_graph() {
         let store: Vec<u64> = vec![];
-        let mut builder = make_builder(&store);
+        let builder = make_builder(&store);
         builder.add_all_vectors();
-        builder.prune_all();
         let graph: MutableGraph = builder.finish();
         assert_eq!(graph.len(), 0);
         assert_eq!(graph.entry_point(), None);
@@ -693,7 +710,7 @@ mod test {
     #[test]
     fn single_node() {
         let store: Vec<u64> = vec![0, 1, 2, 3];
-        let mut builder = make_builder(&store);
+        let builder = make_builder(&store);
         builder.add_node(2);
         let graph: MutableGraph = builder.finish();
         assert_eq!(graph.len(), 4);
@@ -703,11 +720,10 @@ mod test {
     #[test]
     fn tiny_graph() {
         let store: Vec<u64> = (0u64..5u64).collect();
-        let mut builder = make_builder(&store);
+        let builder = make_builder(&store);
         builder.add_all_vectors();
         let graph: MutableGraph = builder.finish();
         assert_eq!(graph.len(), 5);
-        assert_eq!(graph.entry_point(), Some(1));
         assert_eq!(get_neighbors(&graph, 0), vec![1, 2, 3, 4]);
         assert_eq!(get_neighbors(&graph, 1), vec![0, 2, 3, 4]);
         assert_eq!(get_neighbors(&graph, 2), vec![0, 1, 3, 4]);
@@ -718,7 +734,7 @@ mod test {
     #[test]
     fn pruned_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
-        let mut builder = make_builder(&store);
+        let builder = make_builder(&store);
         builder.add_all_vectors();
         let graph: MutableGraph = builder.finish();
         assert_eq!(get_neighbors(&graph, 0), vec![1, 2, 4, 8]);
@@ -730,7 +746,7 @@ mod test {
     #[test]
     fn search_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
-        let mut builder = make_builder(&store);
+        let builder = make_builder(&store);
         builder.add_all_vectors();
         let graph: MutableGraph = builder.finish();
         let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
@@ -756,7 +772,7 @@ mod test {
     #[test]
     fn serialize_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
-        let mut builder = make_builder(&store);
+        let builder = make_builder(&store);
         builder.add_all_vectors();
         let mutable_graph: MutableGraph = builder.finish();
         let mut serialized_graph = Vec::new();
