@@ -10,7 +10,6 @@ ahash = "0.8.11"
 clap = { version = "4.5.1", features = ["derive"] }
 crossbeam-skiplist = "0.1.3"
 indicatif = "0.17.8"
-itertools = "0.12.1"
 memmap2 = "0.9.4"
 ordered-float = "4.2.0"
 rayon = "1.10.0"

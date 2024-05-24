@@ -9,8 +9,7 @@
 
 use std::{
     cell::RefCell,
-    cmp::Reverse,
-    collections::BinaryHeap,
+    fmt::Debug,
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
@@ -100,11 +99,97 @@ pub trait Graph {
     fn len(&self) -> usize;
 }
 
+// more literal translation of diskann paper:
+// maintain a sorted list of neighbors truncated to capacity. terminate when there are no unvisited
+// neighbors in the set.
+
+#[derive(Debug)]
+struct NeighborResult {
+    neighbor: Neighbor,
+    visited: bool,
+}
+
+impl From<Neighbor> for NeighborResult {
+    fn from(value: Neighbor) -> Self {
+        Self {
+            neighbor: value,
+            visited: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NeighborResultSet {
+    results: Vec<NeighborResult>,
+    next_unvisited: usize,
+}
+
+impl NeighborResultSet {
+    fn new(capacity: usize) -> Self {
+        Self {
+            results: Vec::with_capacity(capacity),
+            next_unvisited: 0,
+        }
+    }
+
+    fn add(&mut self, neighbor: Neighbor) {
+        if self.results.len() >= self.results.capacity()
+            && neighbor >= self.results.last().unwrap().neighbor
+        {
+            return;
+        }
+
+        if self.results.len() >= self.results.capacity() {
+            self.results.pop();
+        }
+        let insert_idx = match self.results.binary_search_by_key(&neighbor, |r| r.neighbor) {
+            Ok(_) => return,
+            Err(idx) => idx,
+        };
+        self.results.insert(insert_idx, neighbor.into());
+        if insert_idx < self.next_unvisited {
+            self.next_unvisited = insert_idx;
+        }
+    }
+
+    fn best_unvisited(&mut self) -> Option<Neighbor> {
+        if self.next_unvisited >= self.results.len() {
+            return None;
+        }
+
+        let best_index = self.next_unvisited;
+        self.next_unvisited = self
+            .results
+            .iter()
+            .enumerate()
+            .skip(self.next_unvisited + 1)
+            .find_map(|(i, r)| if r.visited { None } else { Some(i) })
+            .unwrap_or(self.results.len());
+        let best = &mut self.results[best_index];
+        best.visited = true;
+        Some(best.neighbor)
+    }
+
+    fn to_results(&self) -> Vec<Neighbor> {
+        self.results.iter().map(|r| r.neighbor).collect()
+    }
+
+    fn clear(&mut self) {
+        self.results.clear();
+        self.next_unvisited = 0;
+    }
+}
+
+impl From<NeighborResultSet> for Vec<Neighbor> {
+    fn from(value: NeighborResultSet) -> Self {
+        value.results.into_iter().map(|r| r.neighbor).collect()
+    }
+}
+
 #[derive(Debug)]
 pub struct GraphSearcher {
-    k: NonZeroUsize,
-    candidates: BinaryHeap<Reverse<Neighbor>>,
-    results: BinaryHeap<Neighbor>,
+    results: NeighborResultSet,
+    // XXX try a roaring bitmap here.
     seen: AHashSet<usize>,
     visited: Vec<Neighbor>,
 }
@@ -113,9 +198,7 @@ impl GraphSearcher {
     /// Create a new GraphSearcher that will return k results searching.
     pub fn new(k: NonZeroUsize) -> Self {
         Self {
-            k,
-            candidates: BinaryHeap::with_capacity(k.into()),
-            results: BinaryHeap::with_capacity(k.into()),
+            results: NeighborResultSet::new(k.into()),
             seen: AHashSet::new(),
             visited: vec![],
         }
@@ -136,9 +219,7 @@ impl GraphSearcher {
         S: Scorer<Vector = Q>,
     {
         self.search_internal(graph, store, query, scorer, false);
-        // NB: we might get some mileage out of using a min-max heap for this, if for no other
-        // reason than avoiding Reverse and attendant unwrapping.
-        self.results.clone().into_sorted_vec()
+        self.results.to_results()
     }
 
     /// Search `graph` over vector `store` for `query` using `scorer` to compute scores.
@@ -147,17 +228,19 @@ impl GraphSearcher {
         &mut self,
         graph: &G,
         store: &V,
-        query: &Q,
         scorer: &S,
+        node: usize,
     ) where
         G: Graph,
         V: VectorStore<Vector = Q>,
         S: Scorer<Vector = Q>,
     {
-        self.search_internal(graph, store, query, scorer, true);
+        self.seen.insert(node);
+        self.search_internal(graph, store, store.get(node), scorer, true);
         self.visited.sort();
     }
 
+    // XXX we are sometimes catching ourselves in the result set, which is bad.
     fn search_internal<G, V, Q: ?Sized, S>(
         &mut self,
         graph: &G,
@@ -176,13 +259,9 @@ impl GraphSearcher {
         let entry_point = graph.entry_point().unwrap();
         let score = scorer.score(query, store.get(entry_point));
         self.seen.insert(entry_point);
-        self.candidates
-            .push(Reverse((entry_point as u32, score).into()));
+        self.results.add((entry_point as u32, score).into());
 
-        while let Some(Reverse(candidate)) = self.candidates.pop() {
-            if !self.collect(candidate) {
-                break;
-            }
+        while let Some(candidate) = self.results.best_unvisited() {
             if collect_visited {
                 self.visited.push(candidate);
             }
@@ -194,42 +273,12 @@ impl GraphSearcher {
                 }
 
                 let score = scorer.score(query, store.get(neighbor_id));
-                let neighbor = Neighbor::from((neighbor_id as u32, score));
-                // Insert only neighbors that could possibly make it to the result set.
-                // XXX this makes the candidates heap ~unbounded.
-                // if we use a min-max heap here we could bound the size of the heap.
-                if score >= self.min_score() {
-                    self.candidates.push(Reverse(neighbor));
-                }
+                self.results.add((neighbor_id as u32, score).into());
             }
-        }
-    }
-
-    fn collect(&mut self, result: Neighbor) -> bool {
-        if self.results.len() < self.results.capacity() {
-            self.results.push(result);
-            true
-        } else {
-            let mut min_result = self.results.peek_mut().expect("results is not empty");
-            if result.score > min_result.score {
-                *min_result = result;
-                true
-            } else {
-                false
-            }
-        }
-    }
-
-    fn min_score(&self) -> NotNan<f32> {
-        if self.results.len() < self.results.capacity() {
-            NotNan::new(f32::NEG_INFINITY).expect("negative infinity is not nan")
-        } else {
-            self.results.peek().expect("results not empty").score
         }
     }
 
     pub fn clear(&mut self) {
-        self.candidates.clear();
         self.results.clear();
         self.seen.clear();
         self.visited.clear();
@@ -246,7 +295,7 @@ pub struct GraphBuilder<'a, V, S> {
 
     graph: MutableGraph,
     searcher: ThreadLocal<RefCell<GraphSearcher>>,
-    in_flight: SkipSet<u32>,
+    in_flight: SkipSet<usize>,
 }
 
 impl<'a, V, S> GraphBuilder<'a, V, S>
@@ -308,16 +357,19 @@ where
         // Update the set of in-flight nodes to include this one. All in-flight nodes will be added
         // to the visited set to ensure we generate links.
         let query = self.store.get(node);
-        for n in self.in_flight.iter() {
+        self.in_flight.insert(node);
+        for n in self
+            .in_flight
+            .iter()
+            .filter(|i| !i.is_removed() && *i.value() != node)
+        {
             searcher.visited.push(Neighbor::from((
                 *n as u32,
                 self.scorer.score(query, self.store.get(*n as usize)),
             )))
         }
-        self.in_flight.insert(node as u32);
-        searcher.search_for_insertion(&self.graph, self.store, query, &self.scorer);
+        searcher.search_for_insertion(&self.graph, self.store, &self.scorer, node);
         searcher.visited.dedup();
-        searcher.visited.retain(|n| n.id as usize != node);
         let neighbors = self.robust_prune(&searcher.visited);
         self.graph
             .insert_neighbors(node, &neighbors, |unpruned| self.robust_prune(unpruned));
@@ -329,7 +381,7 @@ where
             );
         }
 
-        self.in_flight.remove(&(node as u32));
+        self.in_flight.remove(&node);
     }
 
     /// Wraps up graph building and prepares for search.
@@ -380,9 +432,6 @@ where
 pub struct MutableGraph {
     max_degree: usize,
     entry_point: AtomicUsize,
-    // XXX Vec<Neighbor> ought to be something else that applies an ordering constraint, probably
-    // just default neighbor ordering.
-    // XXX have all updates replace the values rather than updates in place and use crossbeam::epoch.
     nodes: Vec<RwLock<Vec<Neighbor>>>,
 }
 
@@ -426,15 +475,17 @@ impl MutableGraph {
         P: Fn(&[Neighbor]) -> Vec<Neighbor>,
     {
         let mut edges = self.nodes[node].write().unwrap();
-        let cur = edges.clone();
-        edges.clear();
-        for n in itertools::kmerge(vec![&cur, neighbors].into_iter()) {
-            edges.push(*n);
-        }
-        if edges.len() >= edges.capacity() {
-            let pruned = prune(&edges);
-            edges.clear();
-            edges.extend_from_slice(&pruned);
+        for n in neighbors {
+            // TODO we can use the last binary search index as a starting point, and if the value
+            // belongs at the end we could extend_from_slice instead of this.
+            if let Err(index) = edges.binary_search(n) {
+                edges.insert(index, *n);
+                if edges.len() >= edges.capacity() {
+                    let pruned = prune(&edges);
+                    edges.clear();
+                    edges.extend_from_slice(&pruned);
+                }
+            }
         }
     }
 
