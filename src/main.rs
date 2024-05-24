@@ -334,8 +334,8 @@ fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
         builder.add_node(i);
         progress.inc(1);
     });
-    let graph = builder.finish();
     progress.finish_using_style();
+    let graph = builder.finish();
     let mut w = BufWriter::new(File::create(args.index_file)?);
     graph.write(&mut w)?;
     Ok(())
