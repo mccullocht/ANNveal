@@ -8,13 +8,14 @@
 // * choose an arbitrary entrypoint if the preset one cannot be used?
 
 use std::{
+    borrow::Borrow,
     cell::RefCell,
     fmt::Debug,
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         RwLock, RwLockReadGuard,
     },
 };
@@ -37,21 +38,22 @@ pub trait VectorStore {
     /// *Panics* if `i`` is out of bounds.
     fn get(&self, i: usize) -> &Self::Vector;
 
-    // XXX method to approximate centroid. would compute this value up front when building the
-    // graph and periodically search to improve entry point.
-
     /// Return the total number of vectors in the store.
     fn len(&self) -> usize;
 }
 
 /// Trait for scoring vectors against one another.
-// XXX maybe the args shouldn't be by ref so the vector type doesn't have to be unref slice?
 pub trait Scorer {
     /// Type for the underlying vector data.
     type Vector: ?Sized;
 
     /// Return the non-nan score of the two vectors. Larger values are better.
     fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32>;
+
+    fn approximate_centroid<S>(&self, store: &S) -> <Self::Vector as ToOwned>::Owned
+    where
+        S: VectorStore<Vector = Self::Vector>,
+        Self::Vector: ToOwned;
 }
 
 /// Information about a neighbor of a node.
@@ -82,6 +84,21 @@ impl Ord for Neighbor {
 impl PartialOrd for Neighbor {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl From<Neighbor> for u64 {
+    fn from(value: Neighbor) -> Self {
+        (u64::from(value.score.to_bits()) << 32) | u64::from(value.id)
+    }
+}
+
+impl From<u64> for Neighbor {
+    fn from(value: u64) -> Self {
+        Neighbor {
+            id: value as u32,
+            score: NotNan::new(f32::from_bits((value >> 32) as u32)).unwrap(),
+        }
     }
 }
 
@@ -189,7 +206,6 @@ impl From<NeighborResultSet> for Vec<Neighbor> {
 #[derive(Debug)]
 pub struct GraphSearcher {
     results: NeighborResultSet,
-    // XXX try a roaring bitmap here.
     seen: AHashSet<usize>,
     visited: Vec<Neighbor>,
 }
@@ -216,6 +232,7 @@ impl GraphSearcher {
     where
         G: Graph,
         V: VectorStore<Vector = Q>,
+        Q: ?Sized,
         S: Scorer<Vector = Q>,
     {
         self.search_internal(graph, store, query, scorer, false);
@@ -224,15 +241,11 @@ impl GraphSearcher {
 
     /// Search `graph` over vector `store` for `query` using `scorer` to compute scores.
     /// Access visited to view results in descending order by score.
-    fn search_for_insertion<G, V, Q: ?Sized, S>(
-        &mut self,
-        graph: &G,
-        store: &V,
-        scorer: &S,
-        node: usize,
-    ) where
+    fn search_for_insertion<G, V, Q, S>(&mut self, graph: &G, store: &V, scorer: &S, node: usize)
+    where
         G: Graph,
         V: VectorStore<Vector = Q>,
+        Q: ?Sized,
         S: Scorer<Vector = Q>,
     {
         self.seen.insert(node);
@@ -240,8 +253,7 @@ impl GraphSearcher {
         self.visited.sort();
     }
 
-    // XXX we are sometimes catching ourselves in the result set, which is bad.
-    fn search_internal<G, V, Q: ?Sized, S>(
+    fn search_internal<G, V, Q, S>(
         &mut self,
         graph: &G,
         store: &V,
@@ -251,6 +263,7 @@ impl GraphSearcher {
     ) where
         G: Graph,
         V: VectorStore<Vector = Q>,
+        Q: ?Sized,
         S: Scorer<Vector = Q>,
     {
         if graph.entry_point().is_none() {
@@ -286,22 +299,25 @@ impl GraphSearcher {
 }
 
 /// `GraphBuilder` is used to build a vamana graph.
-pub struct GraphBuilder<'a, V, S> {
+pub struct GraphBuilder<'a, V, S, C> {
     max_degree: usize,
     beam_width: NonZeroUsize,
     alpha: f32,
     store: &'a V,
     scorer: S,
+    centroid: C,
 
     graph: MutableGraph,
     searcher: ThreadLocal<RefCell<GraphSearcher>>,
     in_flight: SkipSet<usize>,
 }
 
-impl<'a, V, S> GraphBuilder<'a, V, S>
+impl<'a, V, S, C> GraphBuilder<'a, V, S, C>
 where
     V: VectorStore + Sync + Send,
     S: Scorer<Vector = V::Vector> + Sync + Send,
+    C: Send + Sync + Borrow<V::Vector>,
+    V::Vector: ToOwned<Owned = C>,
 {
     /// Create a new graph builder.
     ///
@@ -321,12 +337,14 @@ where
         scorer: S,
     ) -> Self {
         u32::try_from(store.len()).expect("ordinal count limited to 32 bits");
+        let centroid = scorer.approximate_centroid(store);
         Self {
             max_degree: max_degree.into(),
             beam_width,
             alpha,
             store,
             scorer,
+            centroid,
             graph: MutableGraph::new(store.len(), max_degree),
             searcher: ThreadLocal::with_capacity(current_num_threads()),
             in_flight: SkipSet::new(),
@@ -345,7 +363,13 @@ where
     /// *Panics* if `node` is out of range.
     pub fn add_node(&self, node: usize) {
         assert!(node < self.store.len());
-        if self.graph.try_set_entry_point(node) {
+        let query = self.store.get(node);
+        let centroid_neighbor: Neighbor = (
+            node as u32,
+            self.scorer.score(query, self.centroid.borrow()),
+        )
+            .into();
+        if self.graph.try_set_entry_point(centroid_neighbor) {
             return;
         }
 
@@ -356,7 +380,6 @@ where
         searcher.clear();
         // Update the set of in-flight nodes to include this one. All in-flight nodes will be added
         // to the visited set to ensure we generate links.
-        let query = self.store.get(node);
         self.in_flight.insert(node);
         for n in self
             .in_flight
@@ -382,6 +405,7 @@ where
         }
 
         self.in_flight.remove(&node);
+        self.graph.maybe_update_entry_point(centroid_neighbor);
     }
 
     /// Wraps up graph building and prepares for search.
@@ -390,6 +414,7 @@ where
             self.graph
                 .maybe_prune_neighbors(i, |unpruned| self.robust_prune(unpruned))
         });
+
         self.graph
     }
 
@@ -428,10 +453,15 @@ where
     }
 }
 
+const INITIAL_ENTRY_POINT: Neighbor = Neighbor {
+    id: u32::MAX,
+    score: unsafe { NotNan::new_unchecked(f32::MIN) },
+};
+
 #[derive(Debug)]
 pub struct MutableGraph {
     max_degree: usize,
-    entry_point: AtomicUsize,
+    entry_point: AtomicU64,
     nodes: Vec<RwLock<Vec<Neighbor>>>,
 }
 
@@ -443,15 +473,35 @@ impl MutableGraph {
         });
         Self {
             max_degree: max_degree.get(),
-            entry_point: AtomicUsize::new(usize::MAX),
+            entry_point: AtomicU64::new(INITIAL_ENTRY_POINT.into()),
             nodes,
         }
     }
 
-    fn try_set_entry_point(&self, node: usize) -> bool {
+    fn try_set_entry_point(&self, entry_point: Neighbor) -> bool {
         self.entry_point
-            .compare_exchange(usize::MAX, node, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(
+                INITIAL_ENTRY_POINT.into(),
+                entry_point.into(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
             .is_ok()
+    }
+
+    fn maybe_update_entry_point(&self, entry_point: Neighbor) {
+        let mut current = Neighbor::from(self.entry_point.load(Ordering::Relaxed));
+        while entry_point.score > current.score {
+            match self.entry_point.compare_exchange_weak(
+                current.into(),
+                entry_point.into(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(raw_ep) => current = raw_ep.into(),
+            }
+        }
     }
 
     fn insert_neighbor<P>(&self, node: usize, neighbor: Neighbor, prune: P)
@@ -568,9 +618,9 @@ impl Graph for MutableGraph {
     type NeighborEdgeIterator<'c> = NeighborNodeIterator<'c> where Self: 'c;
 
     fn entry_point(&self) -> Option<usize> {
-        let entry_point = self.entry_point.load(Ordering::Relaxed);
-        if entry_point != usize::MAX {
-            Some(entry_point)
+        let entry_point: Neighbor = self.entry_point.load(Ordering::Relaxed).into();
+        if entry_point != INITIAL_ENTRY_POINT {
+            Some(entry_point.id as usize)
         } else {
             None
         }
@@ -687,7 +737,7 @@ impl<'a> Graph for ImmutableMemoryGraph<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::num::NonZeroUsize;
+    use std::{cmp::Ordering, num::NonZeroUsize};
 
     use ordered_float::NotNan;
 
@@ -719,11 +769,46 @@ mod test {
             let score = ((u64::BITS - distance) as f32) / u64::BITS as f32;
             NotNan::new(score).expect("constant")
         }
+
+        fn approximate_centroid<S>(&self, store: &S) -> <Self::Vector as ToOwned>::Owned
+        where
+            S: VectorStore<Vector = Self::Vector>,
+            Self::Vector: ToOwned,
+        {
+            let mut counts = [0usize; 64];
+            for i in 0..store.len() {
+                let mut v = *store.get(i);
+                while v != 0 {
+                    let j = v.trailing_zeros() as usize;
+                    counts[j] += 1;
+                    v ^= 1 << j;
+                }
+            }
+
+            let mut centroid = 0u64;
+            for (i, c) in counts.into_iter().enumerate() {
+                let d = match c.cmp(&(store.len() / 2)) {
+                    Ordering::Less => false,
+                    Ordering::Greater => true,
+                    Ordering::Equal => {
+                        if store.len() & 1 == 0 {
+                            i % 2 == 0 // on tie, choose an element at random
+                        } else {
+                            false // middle is X.5 and integers round down, so like Less
+                        }
+                    }
+                };
+                if d {
+                    centroid |= 1u64 << i;
+                }
+            }
+            centroid
+        }
     }
 
     fn make_builder<'a, V: VectorStore<Vector = u64> + Sync + Send>(
         store: &'a V,
-    ) -> GraphBuilder<'a, V, Hamming64> {
+    ) -> GraphBuilder<'a, V, Hamming64, u64> {
         GraphBuilder::new(
             NonZeroUsize::new(4).expect("constant"),
             NonZeroUsize::new(10).expect("constant"),
@@ -792,6 +877,7 @@ mod test {
         assert_eq!(get_neighbors(&graph, 7), vec![3, 5, 6, 15]);
         assert_eq!(get_neighbors(&graph, 8), vec![0, 9, 10, 12]);
         assert_eq!(get_neighbors(&graph, 15), vec![7, 11, 13, 14]);
+        assert_eq!(graph.entry_point(), Some(5));
     }
 
     #[test]

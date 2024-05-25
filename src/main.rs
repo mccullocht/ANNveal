@@ -4,8 +4,14 @@ mod vamana;
 mod vec;
 
 use std::{
-    cmp::Reverse, collections::BinaryHeap, fs::File, io::BufWriter, num::NonZeroUsize,
-    path::PathBuf, str::FromStr,
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    fs::File,
+    io::BufWriter,
+    num::NonZeroUsize,
+    path::PathBuf,
+    str::FromStr,
+    time::Instant,
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -310,12 +316,68 @@ impl Scorer for HammingScorer {
         let distance = BinarySimilarity::hamming(a, b).unwrap() as f32;
         NotNan::new((dim - distance) / dim).unwrap()
     }
+
+    fn approximate_centroid<S>(&self, store: &S) -> <Self::Vector as ToOwned>::Owned
+    where
+        S: vamana::VectorStore<Vector = Self::Vector>,
+        Self::Vector: ToOwned,
+    {
+        if store.len() == 0 {
+            return vec![];
+        }
+
+        // NB: this _could_ be paralellized, but it also only takes 1.6s to compute the centroid
+        // over 1M 1536d vectors so it's not a huge problem.
+        let dim = store.get(0).len() * 8;
+        let mut counts = vec![0usize; dim];
+        for i in 0..store.len() {
+            let v = store.get(i);
+            for (j, sv) in v.chunks(8).enumerate() {
+                let mut sv64: u64 = if sv.len() == 8 {
+                    u64::from_le_bytes(sv.try_into().unwrap())
+                } else {
+                    let mut svb = [0u8; 8];
+                    svb[..sv.len()].copy_from_slice(sv);
+                    u64::from_le_bytes(svb)
+                };
+                while sv64 != 0 {
+                    let k = sv64.trailing_zeros() as usize;
+                    counts[j * 64 + k] += 1;
+                    sv64 ^= 1u64 << k;
+                }
+            }
+        }
+
+        let mut centroid = vec![0u8; dim / 8];
+        for (i, c) in counts.into_iter().enumerate() {
+            let d = match c.cmp(&(store.len() / 2)) {
+                Ordering::Less => false,
+                Ordering::Greater => true,
+                Ordering::Equal => {
+                    if store.len() & 1 == 0 {
+                        i % 2 == 0 // on tie, choose an element at random
+                    } else {
+                        false // middle is X.5 and integers round down, so like Less
+                    }
+                }
+            };
+            if d {
+                centroid[i / 8] |= 1u8 << (i % 8);
+            }
+        }
+
+        centroid
+    }
 }
 
 fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     assert_eq!(args.coding, VectorCoding::Bin);
     let vectors_in = unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? };
     let store = BinaryVectorStore::new(&vectors_in, args.dimensions);
+    println!("Approximating centroid");
+    let instant = Instant::now();
+    HammingScorer.approximate_centroid(&store);
+    println!("Approximated centroid in {:?}", instant.elapsed());
     let builder = GraphBuilder::new(
         args.max_degree,
         args.beam_width,
