@@ -1,28 +1,34 @@
+mod quantization;
+mod scorer;
+mod store;
 // XXX remove this
 #[allow(dead_code)]
 mod vamana;
-mod vec;
 
 use std::{
-    cmp::{Ordering, Reverse},
+    cmp::Reverse,
     collections::BinaryHeap,
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Write},
     num::NonZeroUsize,
     path::PathBuf,
     str::FromStr,
-    time::Instant,
 };
 
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
+use quantization::binary_quantize_f32;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use simsimd::BinarySimilarity;
-use vamana::Scorer;
-use vec::{BinaryVectorView, FloatVectorView, VectorView, VectorViewStore};
+use scorer::{EuclideanScorer, VectorScorer};
+use store::SliceFloatVectorStore;
+use vamana::{GraphSearcher, Neighbor};
 
-use crate::vamana::GraphBuilder;
+use crate::{
+    scorer::HammingScorer,
+    store::{SliceBitVectorStore, VectorStore},
+    vamana::{GraphBuilder, ImmutableMemoryGraph},
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -52,6 +58,8 @@ enum Commands {
     Search(SearchArgs),
     /// Build a Vamana vector index from an input flat vector file.
     VamanaBuild(VamanaBuildArgs),
+    /// Search a Vamana vector index stored on disk.
+    VamanaSearch(VamanaSearchArgs),
 }
 
 #[derive(Args)]
@@ -91,7 +99,7 @@ struct VamanaBuildArgs {
     /// Coding of vectors in input flat vector file.
     #[arg(short, long)]
     coding: VectorCoding,
-    // Number of dimensions in input vectors.
+    /// Number of dimensions in input vectors.
     #[arg(short, long)]
     dimensions: NonZeroUsize,
     /// Path to output vamana index file.
@@ -106,6 +114,32 @@ struct VamanaBuildArgs {
     /// Alpha value for pruning; must be >= 1.0
     #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
     alpha: NotNan<f32>,
+}
+
+// XXX need query vectors and printing support.
+#[derive(Args)]
+struct VamanaSearchArgs {
+    /// Path to the serialized vamana graph.
+    #[arg(short, long)]
+    graph: PathBuf,
+    /// Path to the binary vectors.
+    #[arg(short, long)]
+    bin_vectors: PathBuf,
+    /// Path to the float32 vectors. If this is set we will re-rank the results.
+    #[arg(short, long)]
+    f32_vectors: Option<PathBuf>,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
+    /// Beam width for search during index build.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(100).unwrap())]
+    num_candidates: NonZeroUsize,
+    /// Path to input query flat vector file.
+    #[arg(short, long)]
+    queries: PathBuf,
+    /// Number of queries to run. If unset, run all input queries.
+    #[arg(short, long)]
+    num_queries: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,60 +164,67 @@ fn binary_quantize(
     output: PathBuf,
     dimensions: NonZeroUsize,
 ) -> std::io::Result<()> {
-    let vectors_in = unsafe { memmap2::Mmap::map(&File::open(vectors)?)? };
-    let vector_store =
-        vec::VectorViewStore::<'_, FloatVectorView<'_>>::new(vectors_in.as_ref(), dimensions.get());
+    let float_vector_store = SliceFloatVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
+        dimensions,
+    );
     let mut vectors_out = BufWriter::new(File::create(output)?);
-    for v in vector_store.iter() {
-        v.write_binary_quantized(&mut vectors_out)?;
+    for fv in float_vector_store.iter() {
+        for b in binary_quantize_f32(fv) {
+            vectors_out.write_all(std::slice::from_ref(&b))?;
+        }
     }
     Ok(())
 }
 
 fn search(args: SearchArgs) -> std::io::Result<()> {
-    let query_backing = unsafe { memmap2::Mmap::map(&File::open(args.queries)?)? };
-    let query_store = vec::VectorViewStore::<'_, FloatVectorView<'_>>::new(
-        query_backing.as_ref(),
-        args.dimensions.get(),
+    let query_store = SliceFloatVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(args.queries)?)? },
+        args.dimensions,
     );
     let limit = args
         .num_queries
         .map(NonZeroUsize::get)
         .unwrap_or(query_store.len());
 
-    let vector_backing = unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? };
-    let vector_store = vec::VectorViewStore::<'_, FloatVectorView<'_>>::new(
-        vector_backing.as_ref(),
-        args.dimensions.get(),
+    let vector_store = SliceFloatVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
+        args.dimensions,
     );
-    let bin_vector_backing = match args.binary_vectors {
-        Some(p) => Some(unsafe { memmap2::Mmap::map(&File::open(p)?)? }),
+    let bin_vector_store = match args.binary_vectors {
+        Some(p) => Some(SliceBitVectorStore::new(
+            unsafe { memmap2::Mmap::map(&File::open(p)?)? },
+            args.dimensions,
+        )),
         None => None,
     };
-    let bin_vector_store = bin_vector_backing.as_ref().map(|b| {
-        vec::VectorViewStore::<'_, BinaryVectorView<'_>>::new(b.as_ref(), args.dimensions.get())
-    });
     search_queries(
-        query_store,
+        &query_store,
         args.num_candidates,
         limit,
-        vector_store,
-        bin_vector_store,
+        &vector_store,
+        bin_vector_store.as_ref(),
         args.oversample,
     );
     Ok(())
 }
 
 /// Retrieve num_candidates for query in store and return the result in any order.
-fn retrieve<'a, V: VectorView<'a>>(
-    query: V,
-    store: &VectorViewStore<'a, V>,
+fn retrieve<V, B, S>(
+    query: &V,
+    store: &B,
+    scorer: &S,
     num_candidates: usize,
-) -> Vec<Reverse<(NotNan<f32>, usize)>> {
+) -> Vec<Reverse<(NotNan<f32>, usize)>>
+where
+    V: ?Sized,
+    B: VectorStore<Vector = V>,
+    S: VectorScorer<Vector = V>,
+{
     let mut heap: BinaryHeap<Reverse<(NotNan<f32>, usize)>> =
         BinaryHeap::with_capacity(num_candidates + 1);
     for (i, v) in store.iter().enumerate() {
-        let score = NotNan::new(v.score(&query)).unwrap();
+        let score = scorer.score(query, v);
         if heap.len() >= num_candidates {
             if score > heap.peek().unwrap().0 .0 {
                 heap.pop();
@@ -196,63 +237,53 @@ fn retrieve<'a, V: VectorView<'a>>(
     heap.into_vec()
 }
 
-fn full_retrieve<'a>(
-    query: FloatVectorView<'a>,
-    store: &VectorViewStore<'a, FloatVectorView<'a>>,
+fn full_retrieve(
+    query: &[f32],
+    store: &impl VectorStore<Vector = [f32]>,
     num_candidates: usize,
 ) -> Vec<Reverse<(NotNan<f32>, usize)>> {
-    let mut results = retrieve(query, store, num_candidates);
+    let mut results = retrieve(query, store, &EuclideanScorer, num_candidates);
     results.sort();
     results
 }
 
-fn binary_retrieve<'a>(
-    query: FloatVectorView<'a>,
-    store: &VectorViewStore<'a, FloatVectorView<'a>>,
-    bin_store: &VectorViewStore<'a, BinaryVectorView<'a>>,
+fn binary_retrieve(
+    query: &[f32],
+    store: &impl VectorStore<Vector = [f32]>,
+    bin_store: &impl VectorStore<Vector = [u8]>,
     num_candidates: usize,
     oversample: f32,
 ) -> Vec<Reverse<(NotNan<f32>, usize)>> {
-    let binary_query: Vec<u8> = query.binary_quantize().collect();
+    let binary_query: Vec<u8> = binary_quantize_f32(query).collect();
     let results = retrieve(
-        BinaryVectorView::new(binary_query.as_ref(), query.dimensions()),
+        binary_query.as_ref(),
         bin_store,
+        &HammingScorer,
         (num_candidates as f32 * oversample) as usize,
     );
     let mut full_results: Vec<Reverse<(NotNan<f32>, usize)>> = results
         .into_iter()
-        .map(|e| {
-            Reverse((
-                NotNan::new(store.get(e.0 .1).score(&query)).unwrap(),
-                e.0 .1,
-            ))
-        })
+        .map(|e| Reverse((EuclideanScorer.score(query, store.get(e.0 .1)), e.0 .1)))
         .collect();
     full_results.sort();
     full_results.truncate(num_candidates);
     full_results
 }
 
-fn search_queries<'a>(
-    query_store: VectorViewStore<'a, FloatVectorView<'a>>,
+fn search_queries(
+    query_store: &impl VectorStore<Vector = [f32]>,
     num_candidates: NonZeroUsize,
     limit: usize,
-    vector_store: VectorViewStore<'a, FloatVectorView<'a>>,
-    bin_vector_store: Option<VectorViewStore<'a, BinaryVectorView<'a>>>,
+    vector_store: &impl VectorStore<Vector = [f32]>,
+    bin_vector_store: Option<&impl VectorStore<Vector = [u8]>>,
     oversample: f32,
 ) {
     match bin_vector_store {
         Some(bin_store) => {
             for q in query_store.iter().take(limit) {
                 assert_ne!(
-                    binary_retrieve(
-                        q,
-                        &vector_store,
-                        &bin_store,
-                        num_candidates.get(),
-                        oversample
-                    )
-                    .len(),
+                    binary_retrieve(q, vector_store, bin_store, num_candidates.get(), oversample)
+                        .len(),
                     0
                 );
             }
@@ -260,7 +291,7 @@ fn search_queries<'a>(
         None => {
             for q in query_store.iter().take(limit) {
                 assert_ne!(
-                    full_retrieve(q, &vector_store, num_candidates.get(),).len(),
+                    full_retrieve(q, vector_store, num_candidates.get(),).len(),
                     0
                 );
             }
@@ -268,116 +299,12 @@ fn search_queries<'a>(
     }
 }
 
-struct BinaryVectorStore<'a> {
-    vector_data: &'a [u8],
-    stride: usize,
-}
-
-impl<'a> BinaryVectorStore<'a> {
-    fn new(vector_data: &'a [u8], dimensions: NonZeroUsize) -> Self {
-        let stride = (dimensions.get() + 7) / 8;
-        assert_eq!(vector_data.len() % stride, 0);
-        Self {
-            vector_data,
-            stride,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.vector_data.len() / self.stride
-    }
-}
-
-// rayon par_chunks(n) is probably what I want for parallel processing.
-// i'm not entirely sure how i model concurrent build. i guess i could internalize it?
-// if I do that i don't need par_chunks, i can just use a parallel range iterator and then I have
-// to wrap node state in a Mutex
-impl<'a> vamana::VectorStore for BinaryVectorStore<'a> {
-    // XXX this is kind of awkward. I don't know if this is a good idea.
-    type Vector = [u8];
-
-    fn get(&self, i: usize) -> &Self::Vector {
-        let offset = i * self.stride;
-        &self.vector_data[offset..(offset + self.stride)]
-    }
-
-    fn len(&self) -> usize {
-        self.vector_data.len() / self.stride
-    }
-}
-
-struct HammingScorer;
-
-impl Scorer for HammingScorer {
-    type Vector = [u8];
-
-    fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32> {
-        let dim = (a.len() * 8) as f32;
-        let distance = BinarySimilarity::hamming(a, b).unwrap() as f32;
-        NotNan::new((dim - distance) / dim).unwrap()
-    }
-
-    fn approximate_centroid<S>(&self, store: &S) -> <Self::Vector as ToOwned>::Owned
-    where
-        S: vamana::VectorStore<Vector = Self::Vector>,
-        Self::Vector: ToOwned,
-    {
-        if store.len() == 0 {
-            return vec![];
-        }
-
-        // NB: this _could_ be paralellized, but it also only takes 1.6s to compute the centroid
-        // over 1M 1536d vectors so it's not a huge problem.
-        let dim = store.get(0).len() * 8;
-        let mut counts = vec![0usize; dim];
-        for i in 0..store.len() {
-            let v = store.get(i);
-            for (j, sv) in v.chunks(8).enumerate() {
-                let mut sv64: u64 = if sv.len() == 8 {
-                    u64::from_le_bytes(sv.try_into().unwrap())
-                } else {
-                    let mut svb = [0u8; 8];
-                    svb[..sv.len()].copy_from_slice(sv);
-                    u64::from_le_bytes(svb)
-                };
-                while sv64 != 0 {
-                    let k = sv64.trailing_zeros() as usize;
-                    counts[j * 64 + k] += 1;
-                    sv64 ^= 1u64 << k;
-                }
-            }
-        }
-
-        let mut centroid = vec![0u8; dim / 8];
-        for (i, c) in counts.into_iter().enumerate() {
-            let d = match c.cmp(&(store.len() / 2)) {
-                Ordering::Less => false,
-                Ordering::Greater => true,
-                Ordering::Equal => {
-                    if store.len() & 1 == 0 {
-                        i % 2 == 0 // on tie, choose an element at random
-                    } else {
-                        false // middle is X.5 and integers round down, so like Less
-                    }
-                }
-            };
-            if d {
-                centroid[i / 8] |= 1u8 << (i % 8);
-            }
-        }
-
-        centroid
-    }
-}
-
 fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     assert_eq!(args.coding, VectorCoding::Bin);
-    let vectors_in = unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? };
-    let store = BinaryVectorStore::new(&vectors_in, args.dimensions);
-    println!("Approximating centroid");
-    let instant = Instant::now();
-    HammingScorer.approximate_centroid(&store);
-    println!("Approximated centroid in {:?}", instant.elapsed());
+    let store = SliceBitVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
+        args.dimensions,
+    );
     let builder = GraphBuilder::new(
         args.max_degree,
         args.beam_width,
@@ -403,6 +330,104 @@ fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct RerankedResult {
+    result: Neighbor,
+    rank: u32,
+    approx_score: NotNan<f32>,
+}
+
+impl Ord for RerankedResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.result.cmp(&other.result)
+    }
+}
+
+impl PartialOrd for RerankedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
+    let graph_backing = unsafe { memmap2::Mmap::map(&File::open(args.graph)?)? };
+    let graph = ImmutableMemoryGraph::new(&graph_backing).unwrap();
+    let bin_vectors = SliceBitVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(args.bin_vectors)?)? },
+        args.dimensions,
+    );
+    let f32_vectors = match args.f32_vectors {
+        Some(vectors) => Some(SliceFloatVectorStore::new(
+            unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
+            args.dimensions,
+        )),
+        None => None,
+    };
+    let queries = SliceFloatVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(args.queries)?)? },
+        args.dimensions,
+    );
+    let limit = std::cmp::min(
+        args.num_queries
+            .map(NonZeroUsize::get)
+            .unwrap_or(queries.len()),
+        queries.len(),
+    );
+
+    let progress = ProgressBar::new(limit as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template("{wide_bar} {pos}/{len} ETA: {eta_precise} Elapsed: {elapsed_precise}")
+                .unwrap(),
+        )
+        .with_finish(indicatif::ProgressFinish::AndLeave);
+    let mut searcher = GraphSearcher::new(args.num_candidates);
+    let mut rerank_stats: Option<(usize, usize)> = None;
+    for (_, query) in queries.iter().enumerate().take(limit) {
+        let bin_query: Vec<u8> = binary_quantize_f32(query).collect();
+        let results = searcher.search(&graph, &bin_vectors, &bin_query, &HammingScorer);
+        assert_ne!(results.len(), 0);
+        if let Some(store) = f32_vectors.as_ref() {
+            let mut reranked = results
+                .iter()
+                .enumerate()
+                .map(|(i, n)| RerankedResult {
+                    result: Neighbor {
+                        id: n.id,
+                        score: EuclideanScorer.score(query, store.get(n.id as usize)),
+                    },
+                    rank: i as u32,
+                    approx_score: n.score,
+                })
+                .collect::<Vec<_>>();
+            reranked.sort();
+            let (ref mut rank_diff, ref mut count) = rerank_stats.get_or_insert((0, 0));
+            *count += reranked.len();
+            for (i, r) in reranked.into_iter().enumerate() {
+                *rank_diff += i.abs_diff(r.rank as usize);
+            }
+        };
+        searcher.clear();
+        progress.inc(1);
+    }
+
+    progress.finish_using_style();
+    println!(
+        "queries {} avg duration {:.3} ms",
+        limit,
+        progress.elapsed().div_f32(limit as f32).as_micros() as f64 / 1_000f64
+    );
+    if let Some((rerank_diff, count)) = rerank_stats {
+        println!(
+            "result_count {} rerank_diff {} avg {:.2}",
+            count,
+            rerank_diff,
+            rerank_diff as f64 / count as f64
+        );
+    }
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
@@ -414,5 +439,6 @@ fn main() -> std::io::Result<()> {
         } => binary_quantize(vectors, output, dimensions),
         Commands::Search(args) => search(args),
         Commands::VamanaBuild(args) => vamana_build(args),
+        Commands::VamanaSearch(args) => vamana_search(args),
     }
 }
