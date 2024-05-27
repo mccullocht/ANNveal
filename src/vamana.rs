@@ -29,38 +29,13 @@ use rayon::{
 };
 use thread_local::ThreadLocal;
 
-/// Dense store of vector data, analogous to a `Vec``.
-pub trait VectorStore {
-    /// Type of the underlying vector data.
-    type Vector: ?Sized;
-
-    /// Obtain a reference to the contents of the vector by VectorId.
-    /// *Panics* if `i`` is out of bounds.
-    fn get(&self, i: usize) -> &Self::Vector;
-
-    /// Return the total number of vectors in the store.
-    fn len(&self) -> usize;
-}
-
-/// Trait for scoring vectors against one another.
-pub trait Scorer {
-    /// Type for the underlying vector data.
-    type Vector: ?Sized;
-
-    /// Return the non-nan score of the two vectors. Larger values are better.
-    fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32>;
-
-    fn approximate_centroid<S>(&self, store: &S) -> <Self::Vector as ToOwned>::Owned
-    where
-        S: VectorStore<Vector = Self::Vector>,
-        Self::Vector: ToOwned;
-}
+use crate::{scorer::VectorScorer, store::VectorStore};
 
 /// Information about a neighbor of a node.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Neighbor {
-    id: u32,
-    score: NotNan<f32>,
+    pub id: u32,
+    pub score: NotNan<f32>,
 }
 
 impl From<(u32, NotNan<f32>)> for Neighbor {
@@ -115,10 +90,6 @@ pub trait Graph {
     /// Return the number of nodes in the graph.
     fn len(&self) -> usize;
 }
-
-// more literal translation of diskann paper:
-// maintain a sorted list of neighbors truncated to capacity. terminate when there are no unvisited
-// neighbors in the set.
 
 #[derive(Debug)]
 struct NeighborResult {
@@ -233,7 +204,7 @@ impl GraphSearcher {
         G: Graph,
         V: VectorStore<Vector = Q>,
         Q: ?Sized,
-        S: Scorer<Vector = Q>,
+        S: VectorScorer<Vector = Q>,
     {
         self.search_internal(graph, store, query, scorer, false);
         self.results.to_results()
@@ -246,7 +217,7 @@ impl GraphSearcher {
         G: Graph,
         V: VectorStore<Vector = Q>,
         Q: ?Sized,
-        S: Scorer<Vector = Q>,
+        S: VectorScorer<Vector = Q>,
     {
         self.seen.insert(node);
         self.search_internal(graph, store, store.get(node), scorer, true);
@@ -264,7 +235,7 @@ impl GraphSearcher {
         G: Graph,
         V: VectorStore<Vector = Q>,
         Q: ?Sized,
-        S: Scorer<Vector = Q>,
+        S: VectorScorer<Vector = Q>,
     {
         if graph.entry_point().is_none() {
             return;
@@ -305,7 +276,7 @@ pub struct GraphBuilder<'a, V, S, C> {
     alpha: f32,
     store: &'a V,
     scorer: S,
-    centroid: C,
+    mean_vector: C,
 
     graph: MutableGraph,
     searcher: ThreadLocal<RefCell<GraphSearcher>>,
@@ -315,7 +286,7 @@ pub struct GraphBuilder<'a, V, S, C> {
 impl<'a, V, S, C> GraphBuilder<'a, V, S, C>
 where
     V: VectorStore + Sync + Send,
-    S: Scorer<Vector = V::Vector> + Sync + Send,
+    S: VectorScorer<Vector = V::Vector> + Sync + Send,
     C: Send + Sync + Borrow<V::Vector>,
     V::Vector: ToOwned<Owned = C>,
 {
@@ -337,14 +308,14 @@ where
         scorer: S,
     ) -> Self {
         u32::try_from(store.len()).expect("ordinal count limited to 32 bits");
-        let centroid = scorer.approximate_centroid(store);
+        let mean_vector = store.mean_vector();
         Self {
             max_degree: max_degree.into(),
             beam_width,
             alpha,
             store,
             scorer,
-            centroid,
+            mean_vector,
             graph: MutableGraph::new(store.len(), max_degree),
             searcher: ThreadLocal::with_capacity(current_num_threads()),
             in_flight: SkipSet::new(),
@@ -364,11 +335,10 @@ where
     pub fn add_node(&self, node: usize) {
         assert!(node < self.store.len());
         let query = self.store.get(node);
-        let centroid_neighbor: Neighbor = (
+        let centroid_neighbor = Neighbor::from((
             node as u32,
-            self.scorer.score(query, self.centroid.borrow()),
-        )
-            .into();
+            self.scorer.score(query, self.mean_vector.borrow()),
+        ));
         if self.graph.try_set_entry_point(centroid_neighbor) {
             return;
         }
@@ -388,7 +358,7 @@ where
         {
             searcher.visited.push(Neighbor::from((
                 *n as u32,
-                self.scorer.score(query, self.store.get(*n as usize)),
+                self.scorer.score(query, self.store.get(*n)),
             )))
         }
         searcher.search_for_insertion(&self.graph, self.store, &self.scorer, node);
@@ -635,6 +605,8 @@ impl Graph for MutableGraph {
     }
 }
 
+/// In immutable graph implementation that can be loaded from a byte slice.
+// XXX would rather accept AsRef<[u8]> but there are self-referential struct problems there.
 pub struct ImmutableMemoryGraph<'a> {
     entry_point: Option<u32>,
     node_extents: &'a [u64],
@@ -741,11 +713,9 @@ mod test {
 
     use ordered_float::NotNan;
 
-    use crate::vamana::Graph;
+    use crate::{scorer::VectorScorer, vamana::Graph};
 
-    use super::{
-        GraphBuilder, GraphSearcher, ImmutableMemoryGraph, MutableGraph, Scorer, VectorStore,
-    };
+    use super::{GraphBuilder, GraphSearcher, ImmutableMemoryGraph, MutableGraph, VectorStore};
 
     impl VectorStore for Vec<u64> {
         type Vector = u64;
@@ -757,27 +727,11 @@ mod test {
         fn len(&self) -> usize {
             self.len()
         }
-    }
 
-    struct Hamming64;
-
-    impl Scorer for Hamming64 {
-        type Vector = u64;
-
-        fn score(&self, a: &Self::Vector, b: &Self::Vector) -> ordered_float::NotNan<f32> {
-            let distance = (a ^ b).count_ones();
-            let score = ((u64::BITS - distance) as f32) / u64::BITS as f32;
-            NotNan::new(score).expect("constant")
-        }
-
-        fn approximate_centroid<S>(&self, store: &S) -> <Self::Vector as ToOwned>::Owned
-        where
-            S: VectorStore<Vector = Self::Vector>,
-            Self::Vector: ToOwned,
-        {
+        fn mean_vector(&self) -> u64 {
             let mut counts = [0usize; 64];
-            for i in 0..store.len() {
-                let mut v = *store.get(i);
+            for i in 0..self.len() {
+                let mut v = *self.get(i);
                 while v != 0 {
                     let j = v.trailing_zeros() as usize;
                     counts[j] += 1;
@@ -785,13 +739,13 @@ mod test {
                 }
             }
 
-            let mut centroid = 0u64;
+            let mut mean = 0u64;
             for (i, c) in counts.into_iter().enumerate() {
-                let d = match c.cmp(&(store.len() / 2)) {
+                let d = match c.cmp(&(self.len() / 2)) {
                     Ordering::Less => false,
                     Ordering::Greater => true,
                     Ordering::Equal => {
-                        if store.len() & 1 == 0 {
+                        if self.len() & 1 == 0 {
                             i % 2 == 0 // on tie, choose an element at random
                         } else {
                             false // middle is X.5 and integers round down, so like Less
@@ -799,10 +753,22 @@ mod test {
                     }
                 };
                 if d {
-                    centroid |= 1u64 << i;
+                    mean |= 1u64 << i;
                 }
             }
-            centroid
+            mean
+        }
+    }
+
+    struct Hamming64;
+
+    impl VectorScorer for Hamming64 {
+        type Vector = u64;
+
+        fn score(&self, a: &Self::Vector, b: &Self::Vector) -> ordered_float::NotNan<f32> {
+            let distance = (a ^ b).count_ones();
+            let score = ((u64::BITS - distance) as f32) / u64::BITS as f32;
+            NotNan::new(score).expect("constant")
         }
     }
 
