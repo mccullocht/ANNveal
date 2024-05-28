@@ -183,3 +183,46 @@ where
         todo!()
     }
 }
+
+#[derive(Debug)]
+pub struct SliceU32VectorStore<S> {
+    data: S,
+    stride: usize,
+    len: usize,
+}
+
+impl<S> SliceU32VectorStore<S>
+where
+    S: AsRef<[u8]>,
+{
+    pub fn new(data: S, dimensions: NonZeroUsize) -> Self {
+        assert_eq!(data.as_ref().len() % std::mem::size_of::<u32>(), 0);
+        let stride = dimensions.get() * std::mem::size_of::<u32>();
+        assert_eq!(data.as_ref().len() % stride, 0); // XXX improve error handling
+        assert!(unsafe { data.as_ref().align_to::<u32>().0.is_empty() });
+        let len = data.as_ref().len() / stride;
+        Self { data, stride, len }
+    }
+}
+
+impl<S> VectorStore for SliceU32VectorStore<S>
+where
+    S: AsRef<[u8]>,
+{
+    type Vector = [u32];
+
+    fn get(&self, i: usize) -> &Self::Vector {
+        let start = i * self.stride;
+        let end = start + self.stride;
+        // safety: we ensured that the slice aligned correctly at construction.
+        return unsafe { self.data.as_ref()[start..end].align_to::<u32>().1 };
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn mean_vector(&self) -> Vec<u32> {
+        todo!()
+    }
+}

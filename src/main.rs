@@ -1,8 +1,6 @@
 mod quantization;
 mod scorer;
 mod store;
-// XXX remove this
-#[allow(dead_code)]
 mod vamana;
 
 use std::{
@@ -19,9 +17,9 @@ use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::binary_quantize_f32;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 use scorer::{EuclideanScorer, VectorScorer};
-use store::SliceFloatVectorStore;
+use store::{SliceFloatVectorStore, SliceU32VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
@@ -134,12 +132,19 @@ struct VamanaSearchArgs {
     /// Beam width for search during index build.
     #[arg(short, long, default_value_t = NonZeroUsize::new(100).unwrap())]
     num_candidates: NonZeroUsize,
+
     /// Path to input query flat vector file.
     #[arg(short, long)]
     queries: PathBuf,
     /// Number of queries to run. If unset, run all input queries.
     #[arg(short, long)]
     num_queries: Option<NonZeroUsize>,
+    /// List of 100 neighbors for each input query, as an array of `u32`s.
+    #[arg(short, long)]
+    neighbors: Option<PathBuf>,
+    /// Compute recall in top K results. Requires that --neighbors is also set.
+    #[arg(short, long)]
+    recall_k: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +354,11 @@ impl PartialOrd for RerankedResult {
     }
 }
 
+struct RecallState {
+    neighbors: SliceU32VectorStore<memmap2::Mmap>,
+    k: usize,
+}
+
 fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let graph_backing = unsafe { memmap2::Mmap::map(&File::open(args.graph)?)? };
     let graph = ImmutableMemoryGraph::new(&graph_backing).unwrap();
@@ -374,6 +384,19 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         queries.len(),
     );
 
+    let recall_state = match (args.neighbors, args.recall_k) {
+        (Some(n), Some(k)) => Some(RecallState {
+            neighbors: SliceU32VectorStore::new(
+                unsafe { memmap2::Mmap::map(&File::open(n)?)? },
+                NonZeroUsize::new(100).unwrap(),
+            ),
+            k: k.get(),
+        }),
+        (Some(_), None) => panic!("--neighbors set without --recall_k"),
+        (None, Some(_)) => panic!("--recall_k set without --neighbors"),
+        (None, None) => None,
+    };
+
     let progress = ProgressBar::new(limit as u64)
         .with_style(
             ProgressStyle::default_bar()
@@ -383,13 +406,15 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         .with_finish(indicatif::ProgressFinish::AndLeave);
     let mut searcher = GraphSearcher::new(args.num_candidates);
     let mut rerank_stats: Option<(usize, usize)> = None;
-    for (_, query) in queries.iter().enumerate().take(limit) {
+    let mut recall_stats: Option<(usize, usize)> = None;
+    for (i, query) in queries.iter().enumerate().take(limit) {
         let bin_query: Vec<u8> = binary_quantize_f32(query).collect();
-        let results = searcher.search(&graph, &bin_vectors, &bin_query, &HammingScorer);
+        let mut results = searcher.search(&graph, &bin_vectors, &bin_query, &HammingScorer);
         assert_ne!(results.len(), 0);
+
         if let Some(store) = f32_vectors.as_ref() {
             let mut reranked = results
-                .iter()
+                .par_iter()
                 .enumerate()
                 .map(|(i, n)| RerankedResult {
                     result: Neighbor {
@@ -403,10 +428,30 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
             reranked.sort();
             let (ref mut rank_diff, ref mut count) = rerank_stats.get_or_insert((0, 0));
             *count += reranked.len();
-            for (i, r) in reranked.into_iter().enumerate() {
+            for (i, r) in reranked.iter().enumerate() {
                 *rank_diff += i.abs_diff(r.rank as usize);
             }
+            results = reranked.into_iter().map(|e| e.result).collect();
         };
+
+        if let Some(recall_state) = recall_state.as_ref() {
+            let (ref mut matched, ref mut total) = recall_stats.get_or_insert((0, 0));
+            let mut expected: Vec<u32> = recall_state
+                .neighbors
+                .get(i)
+                .iter()
+                .take(recall_state.k)
+                .copied()
+                .collect();
+            expected.sort();
+            for n in results.iter().take(recall_state.k) {
+                *total += 1;
+                if expected.binary_search(&n.id).is_ok() {
+                    *matched += 1;
+                }
+            }
+        }
+
         searcher.clear();
         progress.inc(1);
     }
@@ -424,6 +469,9 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
             rerank_diff,
             rerank_diff as f64 / count as f64
         );
+    }
+    if let Some((matched, total)) = recall_stats {
+        println!("recall {:.5}", matched as f64 / total as f64);
     }
     Ok(())
 }
