@@ -322,13 +322,6 @@ where
         }
     }
 
-    /// Add all vectors from the backing store.
-    fn add_all_vectors(&self) {
-        (0..self.store.len()).into_par_iter().for_each(|i| {
-            self.add_node(i);
-        });
-    }
-
     /// Add a single vector from the backing store.
     ///
     /// *Panics* if `node` is out of range.
@@ -715,6 +708,8 @@ mod test {
 
     use crate::{scorer::VectorScorer, vamana::Graph};
 
+    use rayon::prelude::*;
+
     use super::{GraphBuilder, GraphSearcher, ImmutableMemoryGraph, MutableGraph, VectorStore};
 
     impl VectorStore for Vec<u64> {
@@ -784,6 +779,20 @@ mod test {
         )
     }
 
+    fn build_graph<B: VectorStore<Vector = u64> + Sync + Send>(store: &B) -> MutableGraph {
+        let builder = GraphBuilder::new(
+            NonZeroUsize::new(4).expect("constant"),
+            NonZeroUsize::new(10).expect("constant"),
+            1.2f32,
+            store,
+            Hamming64,
+        );
+        (0..store.len()).into_par_iter().for_each(|i| {
+            builder.add_node(i);
+        });
+        builder.finish()
+    }
+
     fn get_neighbors(graph: &impl Graph, node: usize) -> Vec<usize> {
         let mut edges: Vec<usize> = graph.neighbors_iter(node).collect();
         edges.sort();
@@ -793,19 +802,8 @@ mod test {
     #[test]
     fn empty_store_and_graph() {
         let store: Vec<u64> = vec![];
-        let builder = make_builder(&store);
-        builder.add_all_vectors();
-        let graph: MutableGraph = builder.finish();
+        let graph: MutableGraph = build_graph(&store);
         assert_eq!(graph.len(), 0);
-        assert_eq!(graph.entry_point(), None);
-    }
-
-    #[test]
-    fn empty_graph() {
-        let store: Vec<u64> = vec![0, 1, 2, 3];
-        let builder = make_builder(&store);
-        let graph: MutableGraph = builder.finish();
-        assert_eq!(graph.len(), 4);
         assert_eq!(graph.entry_point(), None);
     }
 
@@ -822,9 +820,7 @@ mod test {
     #[test]
     fn tiny_graph() {
         let store: Vec<u64> = (0u64..5u64).collect();
-        let builder = make_builder(&store);
-        builder.add_all_vectors();
-        let graph: MutableGraph = builder.finish();
+        let graph: MutableGraph = build_graph(&store);
         assert_eq!(graph.len(), 5);
         assert_eq!(get_neighbors(&graph, 0), vec![1, 2, 3, 4]);
         assert_eq!(get_neighbors(&graph, 1), vec![0, 2, 3, 4]);
@@ -836,9 +832,7 @@ mod test {
     #[test]
     fn pruned_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
-        let builder = make_builder(&store);
-        builder.add_all_vectors();
-        let graph: MutableGraph = builder.finish();
+        let graph: MutableGraph = build_graph(&store);
         assert_eq!(get_neighbors(&graph, 0), vec![1, 2, 4, 8]);
         assert_eq!(get_neighbors(&graph, 7), vec![3, 5, 6, 15]);
         assert_eq!(get_neighbors(&graph, 8), vec![0, 9, 10, 12]);
@@ -849,9 +843,7 @@ mod test {
     #[test]
     fn search_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
-        let builder = make_builder(&store);
-        builder.add_all_vectors();
-        let graph: MutableGraph = builder.finish();
+        let graph: MutableGraph = build_graph(&store);
         let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
         let results = searcher.search(&graph, &store, &64, &Hamming64);
         assert_eq!(
@@ -875,9 +867,7 @@ mod test {
     #[test]
     fn serialize_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
-        let builder = make_builder(&store);
-        builder.add_all_vectors();
-        let mutable_graph: MutableGraph = builder.finish();
+        let mutable_graph: MutableGraph = build_graph(&store);
         let mut serialized_graph = Vec::new();
         mutable_graph.write(&mut serialized_graph).unwrap();
         let immutable_graph = ImmutableMemoryGraph::new(&serialized_graph).unwrap();
