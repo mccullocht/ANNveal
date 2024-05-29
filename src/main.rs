@@ -167,6 +167,7 @@ fn binary_quantize(args: BinaryQuantizationArgs) -> std::io::Result<()> {
         progress.inc(1);
     }
     progress.finish_using_style();
+
     Ok(())
 }
 
@@ -331,9 +332,10 @@ struct VamanaSearchArgs {
     /// Path to the binary vectors.
     #[arg(short, long)]
     bin_vectors: PathBuf,
-    /// Path to the float32 vectors. If this is set we will re-rank the results.
+    /// Path to file containing the median vector for quantization.
     #[arg(short, long)]
-    f32_vectors: Option<PathBuf>,
+    quantization_median: Option<PathBuf>,
+
     /// Number of dimensions in input vectors.
     #[arg(short, long)]
     dimensions: NonZeroUsize,
@@ -441,6 +443,15 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         unsafe { memmap2::Mmap::map(&File::open(args.bin_vectors)?)? },
         args.dimensions,
     );
+    let quantization_median_vector_store = if let Some(p) = args.quantization_median {
+        Some(SliceFloatVectorStore::new(
+            unsafe { memmap2::Mmap::map(&File::open(p)?)? },
+            args.dimensions,
+        ))
+    } else {
+        None
+    };
+    let quantization_median = quantization_median_vector_store.as_ref().map(|s| s.get(0));
     let f32_vectors = match args.f32_vectors {
         Some(vectors) => Some(SliceFloatVectorStore::new(
             unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
@@ -494,7 +505,11 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         .map(|((k, budget), store)| Reranker::new(k.get(), budget, store));
     let mut recall_stats: Option<(usize, usize)> = None;
     for (i, query) in queries.iter().enumerate().take(limit) {
-        let bin_query: Vec<u8> = binary_quantize_f32(query).collect();
+        let bin_query: Vec<u8> = if let Some(median) = quantization_median {
+            binary_quantize_f32_median(query, median).collect()
+        } else {
+            binary_quantize_f32(query).collect()
+        };
         let bin_query_scorer = DefaultQueryScorer::new(bin_query.as_ref(), &HammingScorer);
         let mut results = searcher.search(&graph, &bin_vectors, &bin_query_scorer);
         assert_ne!(results.len(), 0);
