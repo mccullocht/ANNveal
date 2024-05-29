@@ -16,13 +16,14 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
-use quantization::binary_quantize_f32;
+use quantization::{binary_quantize_f32, binary_quantize_f32_median};
 use rayon::prelude::*;
 use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
 use store::{SliceFloatVectorStore, SliceU32VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
+    quantization::sampled_binary_quantization_median,
     scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
     store::{SliceBitVectorStore, VectorStore},
     vamana::{GraphBuilder, ImmutableMemoryGraph},
@@ -38,26 +39,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Binary quantize an input vector file.
-    BinaryQuantize {
-        /// Path to input flat vector file.
-        #[arg(short, long)]
-        vectors: PathBuf,
-        /// Coding of vectors in input flat vector file.
-        #[arg(short, long)]
-        coding: VectorCoding,
-        /// Output path of binary coded vectors.
-        #[arg(short, long)]
-        output: PathBuf,
-        // Number of dimensions in input vectors.
-        #[arg(short, long)]
-        dimensions: NonZeroUsize,
-    },
+    BinaryQuantize(BinaryQuantizationArgs),
     /// Search an input vector file using queries from another file.
     Search(SearchArgs),
     /// Build a Vamana vector index from an input flat vector file.
     VamanaBuild(VamanaBuildArgs),
     /// Search a Vamana vector index stored on disk.
     VamanaSearch(VamanaSearchArgs),
+}
+
+#[derive(Args)]
+struct BinaryQuantizationArgs {
+    /// Path to input flat vector file.
+    #[arg(short, long)]
+    vectors: PathBuf,
+    /// Output path of binary coded vectors.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// If set compute a vector containing the median in each dimension from a sample of vectors
+    /// that is used to quantize the data.
+    #[arg(short, long)]
+    median_vector: Option<PathBuf>,
+    // Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
 }
 
 #[derive(Args)]
@@ -131,21 +136,37 @@ impl FromStr for VectorCoding {
     }
 }
 
-fn binary_quantize(
-    vectors: PathBuf,
-    output: PathBuf,
-    dimensions: NonZeroUsize,
-) -> std::io::Result<()> {
+fn binary_quantize(args: BinaryQuantizationArgs) -> std::io::Result<()> {
     let float_vector_store = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
-        dimensions,
+        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
+        args.dimensions,
     );
-    let mut vectors_out = BufWriter::new(File::create(output)?);
+    let median_vector = if let Some(median_path) = args.median_vector {
+        let v = sampled_binary_quantization_median(&float_vector_store, 32 << 10);
+        let mut median_out = BufWriter::new(File::create(median_path)?);
+        for d in v.iter() {
+            median_out.write_all(&d.to_le_bytes())?;
+        }
+        v
+    } else {
+        vec![0.0f32; float_vector_store.dimensions()]
+    };
+    let mut vectors_out = BufWriter::new(File::create(args.output)?);
+
+    let progress = ProgressBar::new(float_vector_store.len() as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template("{wide_bar} {pos}/{len} ETA: {eta_precise} Elapsed: {elapsed_precise}")
+                .unwrap(),
+        )
+        .with_finish(indicatif::ProgressFinish::AndLeave);
     for fv in float_vector_store.iter() {
-        for b in binary_quantize_f32(fv) {
+        for b in binary_quantize_f32_median(fv, &median_vector) {
             vectors_out.write_all(std::slice::from_ref(&b))?;
         }
+        progress.inc(1);
     }
+    progress.finish_using_style();
     Ok(())
 }
 
@@ -541,12 +562,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
 fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
-        Commands::BinaryQuantize {
-            vectors,
-            coding: _,
-            output,
-            dimensions,
-        } => binary_quantize(vectors, output, dimensions),
+        Commands::BinaryQuantize(args) => binary_quantize(args),
         Commands::Search(args) => search(args),
         Commands::VamanaBuild(args) => vamana_build(args),
         Commands::VamanaSearch(args) => vamana_search(args),

@@ -5,6 +5,9 @@ pub trait VectorStore {
     /// Type of the underlying vector data.
     type Vector: ?Sized;
 
+    /// Return the number of dimensions in the data store.
+    fn dimensions(&self) -> usize;
+
     /// Obtain a reference to the contents of the vector by VectorId.
     /// *Panics* if `i`` is out of bounds.
     fn get(&self, i: usize) -> &Self::Vector;
@@ -81,6 +84,10 @@ where
     S: AsRef<[u8]>,
 {
     type Vector = [u8];
+
+    fn dimensions(&self) -> usize {
+        self.stride * 8
+    }
 
     fn get(&self, i: usize) -> &Self::Vector {
         let start = i * self.stride;
@@ -168,6 +175,10 @@ where
 {
     type Vector = [f32];
 
+    fn dimensions(&self) -> usize {
+        self.stride / std::mem::size_of::<f32>()
+    }
+
     fn get(&self, i: usize) -> &Self::Vector {
         let start = i * self.stride;
         let end = start + self.stride;
@@ -210,6 +221,10 @@ where
     S: AsRef<[u8]>,
 {
     type Vector = [u32];
+
+    fn dimensions(&self) -> usize {
+        self.stride / std::mem::size_of::<u32>()
+    }
 
     fn get(&self, i: usize) -> &Self::Vector {
         let start = i * self.stride;

@@ -705,6 +705,10 @@ mod test {
     impl VectorStore for Vec<u64> {
         type Vector = u64;
 
+        fn dimensions(&self) -> usize {
+            u64::BITS as usize
+        }
+
         fn get(&self, i: usize) -> &Self::Vector {
             &self[i]
         }
