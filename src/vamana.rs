@@ -269,6 +269,16 @@ impl GraphSearcher {
     }
 }
 
+// XXX Add a VectorStoreScorer that allows you to score a typed vector against a node id.
+// this may also need to provide access to the underlying store.
+// it must have an associated type for the vector type.
+// this can replace V and S on GraphSearcher
+//
+// GraphBuilder need to (optionally) take two of these. the problem that we have is that if you opt
+// to use None you still have to specify a type which is hella annoying. I can curry in another
+// trait that wraps one or two different VectorStoreScorers. I still want to avoid unnecessarily
+// re-scoring which is tricky to work into the interface.
+
 /// `GraphBuilder` is used to build a vamana graph.
 pub struct GraphBuilder<'a, V, S, C> {
     max_degree: usize,
