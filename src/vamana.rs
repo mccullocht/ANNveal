@@ -14,6 +14,7 @@ use std::{
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
+    ops::Range,
     sync::{
         atomic::{AtomicU64, Ordering},
         RwLock, RwLockReadGuard,
@@ -602,8 +603,10 @@ impl Graph for MutableGraph {
 // XXX would rather accept AsRef<[u8]> but there are self-referential struct problems there.
 pub struct ImmutableMemoryGraph<'a> {
     entry_point: Option<u32>,
-    node_extents: &'a [u64],
-    edges: &'a [u32],
+    rep: &'a [u8],
+    num_nodes: usize,
+    node_extents_range: Range<usize>,
+    edges_range: Range<usize>,
 }
 
 impl<'a> ImmutableMemoryGraph<'a> {
@@ -611,15 +614,20 @@ impl<'a> ImmutableMemoryGraph<'a> {
         if rep.len() < 8 {
             return Err("rep too short to contain a valid graph");
         }
+        let mut offset = 0usize;
         let (num_nodes, rep) = Self::decode_u32(rep);
+        offset += std::mem::size_of::<u32>();
         if num_nodes == 0 {
             return Ok(Self {
                 entry_point: None,
-                node_extents: &[],
-                edges: &[],
+                rep: &[],
+                num_nodes: 0,
+                node_extents_range: 0..0,
+                edges_range: 0..0,
             });
         }
         let (entry_point, rep) = Self::decode_u32(rep);
+        offset += std::mem::size_of::<u32>();
         if entry_point >= num_nodes {
             return Err("invalid entry point");
         }
@@ -627,24 +635,27 @@ impl<'a> ImmutableMemoryGraph<'a> {
         if rep.len() < node_extent_bytes {
             return Err("rep too short to contain all node extents");
         }
-        let (prefix, node_extents, suffix) = unsafe { rep[0..node_extent_bytes].align_to::<u64>() };
-        if !prefix.is_empty() || !suffix.is_empty() {
-            return Err("rep does not align to u64 for node_extents");
-        }
-        let num_edges = node_extents.last().unwrap().to_le();
+        let node_extents_range = offset..(offset + node_extent_bytes);
+        offset += node_extent_bytes;
+        let num_edges = unsafe {
+            std::ptr::read_unaligned(
+                rep.as_ptr()
+                    .add(node_extents_range.start)
+                    .cast::<u64>()
+                    .add(num_nodes as usize),
+            )
+        };
         let edges_bytes = num_edges as usize * std::mem::size_of::<u32>();
         if rep.len() < node_extent_bytes + edges_bytes {
             return Err("rep too short to contain all edges");
         }
-        let (prefix, edges, suffix) =
-            unsafe { rep[node_extent_bytes..(node_extent_bytes + edges_bytes)].align_to::<u32>() };
-        if !prefix.is_empty() || !suffix.is_empty() {
-            return Err("rep does not align to u32 for edges");
-        }
+        let edges_range = node_extents_range.end..(node_extents_range.end + edges_bytes);
         Ok(Self {
             entry_point: Some(entry_point),
-            node_extents,
-            edges,
+            rep,
+            num_nodes: num_nodes as usize,
+            node_extents_range,
+            edges_range,
         })
     }
 
@@ -655,15 +666,21 @@ impl<'a> ImmutableMemoryGraph<'a> {
 }
 
 pub struct ImmutableEdgeIterator<'a> {
+    // just UGH
     it: std::slice::Iter<'a, u32>,
 }
 
 impl<'a, 'b> ImmutableEdgeIterator<'a> {
     fn new(graph: &'b ImmutableMemoryGraph<'a>, node: usize) -> Self {
-        let begin = graph.node_extents[node] as usize;
-        let end = graph.node_extents[node + 1] as usize;
-        Self {
-            it: graph.edges[begin..end].iter(),
+        assert!(node < graph.num_nodes);
+        unsafe {
+            let node_extents_ptr =
+                graph.rep.as_ptr().add(graph.node_extents_range.start) as *const u64;
+            let begin = std::ptr::read_unaligned(node_extents_ptr.add(node)).to_le() as usize;
+            let end = std::ptr::read_unaligned(node_extents_ptr.add(node + 1)).to_le() as usize;
+            Self {
+                it: graph.edges[begin..end].iter(),
+            }
         }
     }
 }
@@ -696,7 +713,7 @@ impl<'a> Graph for ImmutableMemoryGraph<'a> {
     }
 
     fn len(&self) -> usize {
-        self.node_extents.len() - 1
+        self.num_nodes
     }
 }
 
