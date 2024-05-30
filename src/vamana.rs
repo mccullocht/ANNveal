@@ -356,14 +356,16 @@ where
         }
         searcher.search_for_insertion(&self.graph, self.store, &self.scorer, node);
         searcher.visited.dedup();
-        let neighbors = self.robust_prune(&searcher.visited);
+        let neighbors = self.robust_prune(node, &searcher.visited);
         self.graph
-            .insert_neighbors(node, &neighbors, |unpruned| self.robust_prune(unpruned));
+            .insert_neighbors(node, &neighbors, |node, unpruned| {
+                self.robust_prune(node, unpruned)
+            });
         for n in neighbors {
             self.graph.insert_neighbor(
                 n.id as usize,
                 Neighbor::from((node as u32, n.score)),
-                |unpruned| self.robust_prune(unpruned),
+                |node, unpruned| self.robust_prune(node, unpruned),
             );
         }
 
@@ -375,14 +377,37 @@ where
     pub fn finish(self) -> MutableGraph {
         (0..self.store.len()).into_par_iter().for_each(|i| {
             self.graph
-                .maybe_prune_neighbors(i, |unpruned| self.robust_prune(unpruned))
+                .maybe_prune_neighbors(i, |node, unpruned| self.robust_prune(node, unpruned))
         });
 
         self.graph
     }
 
     /// REQUIRES: neighbors is sorted in descending order by score.
-    fn robust_prune(&self, neighbors: &[Neighbor]) -> Vec<Neighbor> {
+    fn robust_prune(&self, node: usize, neighbors: &[Neighbor]) -> Vec<Neighbor> {
+        // XXX this algorithm is not safe to run concurrently.
+        // during concurrent insertion of nodes A and B they are likely to have edges to one
+        // another. as we prune the edges for these nodes they will attempt to obtain a read lock
+        // on each other for fof analysis and deadlock. if we had a lockless graph representation
+        // then this would work.
+        let mut pruned = Vec::with_capacity(self.max_degree);
+        let mut fof = AHashSet::new();
+        fof.insert(node);
+        for n in neighbors {
+            if fof.contains(&(n.id as usize)) {
+                continue;
+            }
+
+            pruned.push(*n);
+            if pruned.len() == self.max_degree {
+                break;
+            }
+            for n in self.graph.neighbors_iter(n.id as usize) {
+                fof.insert(n);
+            }
+        }
+        pruned
+        /*
         let mut prune_factor =
             vec![NotNan::new(0.0f32).expect("not NaN constant"); neighbors.len()];
         let mut pruned = Vec::with_capacity(self.max_degree);
@@ -413,6 +438,7 @@ where
             cur_alpha *= 1.2;
         }
         pruned
+        */
     }
 }
 
@@ -469,14 +495,14 @@ impl MutableGraph {
 
     fn insert_neighbor<P>(&self, node: usize, neighbor: Neighbor, prune: P)
     where
-        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+        P: Fn(usize, &[Neighbor]) -> Vec<Neighbor>,
     {
         let mut edges = self.nodes[node].write().unwrap();
         assert_ne!(node, neighbor.id as usize);
         if let Err(index) = edges.binary_search(&neighbor) {
             edges.insert(index, neighbor);
             if edges.len() >= edges.capacity() {
-                let pruned = prune(&edges);
+                let pruned = prune(node, &edges);
                 edges.clear();
                 edges.extend_from_slice(&pruned);
             }
@@ -485,7 +511,7 @@ impl MutableGraph {
 
     fn insert_neighbors<P>(&self, node: usize, neighbors: &[Neighbor], prune: P)
     where
-        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+        P: Fn(usize, &[Neighbor]) -> Vec<Neighbor>,
     {
         let mut edges = self.nodes[node].write().unwrap();
         for n in neighbors {
@@ -494,7 +520,7 @@ impl MutableGraph {
             if let Err(index) = edges.binary_search(n) {
                 edges.insert(index, *n);
                 if edges.len() >= edges.capacity() {
-                    let pruned = prune(&edges);
+                    let pruned = prune(node, &edges);
                     edges.clear();
                     edges.extend_from_slice(&pruned);
                 }
@@ -504,11 +530,11 @@ impl MutableGraph {
 
     fn maybe_prune_neighbors<P>(&self, node: usize, prune: P)
     where
-        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+        P: Fn(usize, &[Neighbor]) -> Vec<Neighbor>,
     {
         let mut edges = self.nodes[node].write().unwrap();
         if edges.len() >= self.max_degree {
-            let pruned = prune(&edges);
+            let pruned = prune(node, &edges);
             edges.clear();
             edges.extend_from_slice(&pruned);
         }
