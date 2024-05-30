@@ -539,13 +539,17 @@ impl MutableGraph {
 pub struct NeighborNodeIterator<'a> {
     guard: RwLockReadGuard<'a, Vec<Neighbor>>,
     next: usize,
+    limit: usize,
 }
 
 impl<'a> NeighborNodeIterator<'a> {
-    fn new(neighbors: &'a RwLock<Vec<Neighbor>>) -> Self {
+    fn new(neighbors: &'a RwLock<Vec<Neighbor>>, max_degree: usize) -> Self {
+        let guard = neighbors.read().unwrap();
+        let limit = std::cmp::min(guard.len(), max_degree);
         Self {
-            guard: neighbors.read().unwrap(),
+            guard,
             next: 0,
+            limit,
         }
     }
 }
@@ -554,7 +558,7 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.guard.len() {
+        if self.next >= self.limit {
             return None;
         }
 
@@ -564,8 +568,8 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = if self.next < self.guard.len() {
-            self.guard.len() - self.next
+        let size = if self.next < self.limit {
+            self.limit - self.next
         } else {
             0
         };
@@ -590,7 +594,7 @@ impl Graph for MutableGraph {
     }
 
     fn neighbors_iter(&self, ord: usize) -> Self::NeighborEdgeIterator<'_> {
-        NeighborNodeIterator::new(&self.nodes[ord])
+        NeighborNodeIterator::new(&self.nodes[ord], self.max_degree)
     }
 
     fn len(&self) -> usize {
