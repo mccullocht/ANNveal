@@ -12,9 +12,10 @@ pub fn binary_quantize_f32(vector: &[f32]) -> impl Iterator<Item = u8> + '_ {
         .map(|v| binary_quantize_f32_median_chunk(v, &ZERO_CHUNK))
 }
 
-/// Computes a vector containing the median point in every dimension for an adaptive binary
-/// quantization scheme.
-pub fn sampled_binary_quantization_median<S>(store: &S, samples: usize) -> Vec<f32>
+/// Computes vectors containing the 25th, median, and 75th percentile values in each dimension from
+/// a sample. The median is used to improve the quality of quantization, the other percentiles are
+/// used to improve the quality of dequantization when scoring against a float vector.
+pub fn sampled_binary_quantization_quartiles<S>(store: &S, samples: usize) -> [Vec<f32>; 3]
 where
     S: VectorStore<Vector = [f32]>,
 {
@@ -34,12 +35,17 @@ where
             data[j * sampled.len() + i] = *v;
         }
     }
-    data.chunks_mut(sampled.len())
-        .map(|d| {
-            d.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            d[d.len() / 2]
-        })
-        .collect()
+    let mut quartiles: [Vec<f32>; 3] = vec![Vec::with_capacity(store.dimensions()); 3]
+        .try_into()
+        .unwrap();
+    let interval = sampled.len() / 4;
+    for dim in data.chunks_mut(sampled.len()) {
+        dim.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        quartiles[0].push(dim[interval]);
+        quartiles[1].push(dim[interval * 2]);
+        quartiles[2].push(dim[interval * 3]);
+    }
+    quartiles
 }
 
 pub fn binary_quantize_f32_median<'a, 'b: 'a>(

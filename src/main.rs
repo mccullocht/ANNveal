@@ -16,14 +16,15 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
-use quantization::{binary_quantize_f32, binary_quantize_f32_median};
+use quantization::{
+    binary_quantize_f32, binary_quantize_f32_median, sampled_binary_quantization_quartiles,
+};
 use rayon::prelude::*;
 use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
 use store::{SliceFloatVectorStore, SliceU32VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
-    quantization::sampled_binary_quantization_median,
     scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
     store::{SliceBitVectorStore, VectorStore},
     vamana::{GraphBuilder, ImmutableMemoryGraph},
@@ -46,23 +47,6 @@ enum Commands {
     VamanaBuild(VamanaBuildArgs),
     /// Search a Vamana vector index stored on disk.
     VamanaSearch(VamanaSearchArgs),
-}
-
-#[derive(Args)]
-struct BinaryQuantizationArgs {
-    /// Path to input flat vector file.
-    #[arg(short, long)]
-    vectors: PathBuf,
-    /// Output path of binary coded vectors.
-    #[arg(short, long)]
-    output: PathBuf,
-    /// If set compute a vector containing the median in each dimension from a sample of vectors
-    /// that is used to quantize the data.
-    #[arg(short, long)]
-    median_vector: Option<PathBuf>,
-    // Number of dimensions in input vectors.
-    #[arg(short, long)]
-    dimensions: NonZeroUsize,
 }
 
 #[derive(Args)]
@@ -136,18 +120,37 @@ impl FromStr for VectorCoding {
     }
 }
 
+#[derive(Args)]
+struct BinaryQuantizationArgs {
+    /// Path to input flat vector file.
+    #[arg(short, long)]
+    vectors: PathBuf,
+    /// Output path of binary coded vectors.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// If set compute a set containing the median, 25th and 75th percentile values.
+    /// The median is used to quantize vectors, the other percentiles are used to dequantize values.
+    #[arg(short, long)]
+    quartile_vectors: Option<PathBuf>,
+    // Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
+}
+
 fn binary_quantize(args: BinaryQuantizationArgs) -> std::io::Result<()> {
     let float_vector_store = SliceFloatVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
         args.dimensions,
     );
-    let median_vector = if let Some(median_path) = args.median_vector {
-        let v = sampled_binary_quantization_median(&float_vector_store, 32 << 10);
-        let mut median_out = BufWriter::new(File::create(median_path)?);
-        for d in v.iter() {
-            median_out.write_all(&d.to_le_bytes())?;
+    let median_vector = if let Some(path) = args.quartile_vectors {
+        let quartiles = sampled_binary_quantization_quartiles(&float_vector_store, 32 << 10);
+        let mut quartiles_out = BufWriter::new(File::create(path)?);
+        for v in quartiles.iter() {
+            for d in v.iter() {
+                quartiles_out.write_all(&d.to_le_bytes())?;
+            }
         }
-        v
+        quartiles[1].clone()
     } else {
         vec![0.0f32; float_vector_store.dimensions()]
     };
