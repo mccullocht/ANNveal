@@ -1,12 +1,3 @@
-// XXX filtered search
-//
-// we want to avoid scoring a lot of stuff we can't collect.
-// * read edges of candidates and filter.
-// * if there are too few neighbors (none?) automatically traverse neighbors-of-neighbors.
-// * get greedy: insert edges that don't match the filter at a very low or partial score.
-// * use a much longer candidate list.
-// * choose an arbitrary entrypoint if the preset one cannot be used?
-
 use std::{
     borrow::Borrow,
     cell::RefCell,
@@ -29,7 +20,10 @@ use rayon::{
 };
 use thread_local::ThreadLocal;
 
-use crate::{scorer::VectorScorer, store::VectorStore};
+use crate::{
+    scorer::{DefaultQueryScorer, QueryScorer, VectorScorer},
+    store::VectorStore,
+};
 
 /// Information about a neighbor of a node.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -193,20 +187,13 @@ impl GraphSearcher {
 
     /// Search `graph` over vector `store` for `query` and return the `k` nearest neighbors in
     /// descending order by score.
-    pub fn search<G, V, Q, S>(
-        &mut self,
-        graph: &G,
-        store: &V,
-        query: &Q,
-        scorer: &S,
-    ) -> Vec<Neighbor>
+    pub fn search<G, V, Q>(&mut self, graph: &G, store: &V, query_scorer: &Q) -> Vec<Neighbor>
     where
         G: Graph,
-        V: VectorStore<Vector = Q>,
-        Q: ?Sized,
-        S: VectorScorer<Vector = Q>,
+        Q: QueryScorer,
+        V: VectorStore<Vector = Q::Vector>,
     {
-        self.search_internal(graph, store, query, scorer, false);
+        self.search_internal(graph, store, query_scorer, false);
         self.results.to_results()
     }
 
@@ -220,28 +207,27 @@ impl GraphSearcher {
         S: VectorScorer<Vector = Q>,
     {
         self.seen.insert(node);
-        self.search_internal(graph, store, store.get(node), scorer, true);
+        let query_scorer = DefaultQueryScorer::new(store.get(node), scorer);
+        self.search_internal(graph, store, &query_scorer, true);
         self.visited.sort();
     }
 
-    fn search_internal<G, V, Q, S>(
+    fn search_internal<G, V, Q>(
         &mut self,
         graph: &G,
         store: &V,
-        query: &Q,
-        scorer: &S,
+        query_scorer: &Q,
         collect_visited: bool,
     ) where
         G: Graph,
-        V: VectorStore<Vector = Q>,
-        Q: ?Sized,
-        S: VectorScorer<Vector = Q>,
+        Q: QueryScorer,
+        V: VectorStore<Vector = Q::Vector>,
     {
         if graph.entry_point().is_none() {
             return;
         }
         let entry_point = graph.entry_point().unwrap();
-        let score = scorer.score(query, store.get(entry_point));
+        let score = query_scorer.score(store.get(entry_point));
         self.seen.insert(entry_point);
         self.results.add((entry_point as u32, score).into());
 
@@ -256,7 +242,7 @@ impl GraphSearcher {
                     continue;
                 }
 
-                let score = scorer.score(query, store.get(neighbor_id));
+                let score = query_scorer.score(store.get(neighbor_id));
                 self.results.add((neighbor_id as u32, score).into());
             }
         }
@@ -706,7 +692,10 @@ mod test {
 
     use ordered_float::NotNan;
 
-    use crate::{scorer::VectorScorer, vamana::Graph};
+    use crate::{
+        scorer::{DefaultQueryScorer, VectorScorer},
+        vamana::Graph,
+    };
 
     use rayon::prelude::*;
 
@@ -755,6 +744,7 @@ mod test {
         }
     }
 
+    #[derive(Copy, Clone)]
     struct Hamming64;
 
     impl VectorScorer for Hamming64 {
@@ -845,7 +835,8 @@ mod test {
         let store: Vec<u64> = (0u64..16u64).collect();
         let graph: MutableGraph = build_graph(&store);
         let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
-        let results = searcher.search(&graph, &store, &64, &Hamming64);
+        let query_scorer = DefaultQueryScorer::new(&64, &Hamming64);
+        let results = searcher.search(&graph, &store, &query_scorer);
         assert_eq!(
             results
                 .into_iter()
@@ -877,7 +868,8 @@ mod test {
         assert_eq!(get_neighbors(&immutable_graph, 8), vec![0, 9, 10, 12]);
         assert_eq!(get_neighbors(&immutable_graph, 15), vec![7, 11, 13, 14]);
         let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
-        let results = searcher.search(&immutable_graph, &store, &64, &Hamming64);
+        let query_scorer = DefaultQueryScorer::new(&64, &Hamming64);
+        let results = searcher.search(&immutable_graph, &store, &query_scorer);
         assert_eq!(
             results
                 .into_iter()

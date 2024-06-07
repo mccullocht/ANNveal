@@ -18,12 +18,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::binary_quantize_f32;
 use rayon::prelude::*;
-use scorer::{EuclideanScorer, VectorScorer};
+use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
 use store::{SliceFloatVectorStore, SliceU32VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
-    scorer::HammingScorer,
+    scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
     store::{SliceBitVectorStore, VectorStore},
     vamana::{GraphBuilder, ImmutableMemoryGraph},
 };
@@ -112,39 +112,6 @@ struct VamanaBuildArgs {
     /// Alpha value for pruning; must be >= 1.0
     #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
     alpha: NotNan<f32>,
-}
-
-// XXX need query vectors and printing support.
-#[derive(Args)]
-struct VamanaSearchArgs {
-    /// Path to the serialized vamana graph.
-    #[arg(short, long)]
-    graph: PathBuf,
-    /// Path to the binary vectors.
-    #[arg(short, long)]
-    bin_vectors: PathBuf,
-    /// Path to the float32 vectors. If this is set we will re-rank the results.
-    #[arg(short, long)]
-    f32_vectors: Option<PathBuf>,
-    /// Number of dimensions in input vectors.
-    #[arg(short, long)]
-    dimensions: NonZeroUsize,
-    /// Beam width for search during index build.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(100).unwrap())]
-    num_candidates: NonZeroUsize,
-
-    /// Path to input query flat vector file.
-    #[arg(short, long)]
-    queries: PathBuf,
-    /// Number of queries to run. If unset, run all input queries.
-    #[arg(short, long)]
-    num_queries: Option<NonZeroUsize>,
-    /// List of 100 neighbors for each input query, as an array of `u32`s.
-    #[arg(short, long)]
-    neighbors: Option<PathBuf>,
-    /// Compute recall in top K results. Requires that --neighbors is also set.
-    #[arg(short, long)]
-    recall_k: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +302,41 @@ fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Args)]
+struct VamanaSearchArgs {
+    /// Path to the serialized vamana graph.
+    #[arg(short, long)]
+    graph: PathBuf,
+    /// Path to the binary vectors.
+    #[arg(short, long)]
+    bin_vectors: PathBuf,
+    /// If true, re-rank f32 query against binary vectors after retrieval completes.
+    #[arg(long, default_value_t = false)]
+    bit_rerank: bool,
+    /// Path to the float32 vectors. If this is set we will re-rank the results.
+    #[arg(short, long)]
+    f32_vectors: Option<PathBuf>,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
+    /// Beam width for search during index build.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(100).unwrap())]
+    num_candidates: NonZeroUsize,
+
+    /// Path to input query flat vector file.
+    #[arg(short, long)]
+    queries: PathBuf,
+    /// Number of queries to run. If unset, run all input queries.
+    #[arg(short, long)]
+    num_queries: Option<NonZeroUsize>,
+    /// List of 100 neighbors for each input query, as an array of `u32`s.
+    #[arg(short, long)]
+    neighbors: Option<PathBuf>,
+    /// Compute recall in top K results. Requires that --neighbors is also set.
+    #[arg(short, long)]
+    recall_k: Option<NonZeroUsize>,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct RerankedResult {
     result: Neighbor,
@@ -351,6 +353,70 @@ impl Ord for RerankedResult {
 impl PartialOrd for RerankedResult {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+struct Reranker<'a, B> {
+    k: usize,
+    store: &'a B,
+
+    rank_diff: usize,
+    count: usize,
+}
+
+impl<'a, B> Reranker<'a, B>
+where
+    B: VectorStore + Send + Sync,
+{
+    fn new(k: usize, store: &'a B) -> Self {
+        Self {
+            k,
+            store,
+            rank_diff: 0,
+            count: 0,
+        }
+    }
+
+    fn rerank<Q>(&mut self, results: &Vec<Neighbor>, query_scorer: &Q) -> Vec<Neighbor>
+    where
+        Q: QueryScorer<Vector = B::Vector> + Send + Sync,
+    {
+        let mut reranked = results
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    i,
+                    Neighbor {
+                        id: n.id,
+                        score: query_scorer.score(self.store.get(n.id as usize)),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        reranked.sort_by_key(|r| r.1);
+        reranked
+            .into_iter()
+            .enumerate()
+            .take(self.k)
+            .map(|(i, (r, n))| {
+                self.rank_diff += i.abs_diff(r);
+                self.count += 1;
+                n
+            })
+            .collect()
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn rank_diff(&self) -> usize {
+        self.rank_diff
+    }
+
+    fn avg_rank_diff(&self) -> f64 {
+        self.rank_diff as f64 / self.count as f64
     }
 }
 
@@ -405,34 +471,30 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         )
         .with_finish(indicatif::ProgressFinish::AndLeave);
     let mut searcher = GraphSearcher::new(args.num_candidates);
-    let mut rerank_stats: Option<(usize, usize)> = None;
+    let mut bit_reranker = args
+        .recall_k
+        .filter(|_| args.bit_rerank)
+        .map(|k| Reranker::new(k.get(), &bin_vectors));
+    let mut f32_reranker = f32_vectors
+        .as_ref()
+        .zip(args.recall_k)
+        .map(|(b, k)| Reranker::new(k.get(), b));
     let mut recall_stats: Option<(usize, usize)> = None;
     for (i, query) in queries.iter().enumerate().take(limit) {
         let bin_query: Vec<u8> = binary_quantize_f32(query).collect();
-        let mut results = searcher.search(&graph, &bin_vectors, &bin_query, &HammingScorer);
+        let bin_query_scorer = DefaultQueryScorer::new(bin_query.as_ref(), &HammingScorer);
+        let mut results = searcher.search(&graph, &bin_vectors, &bin_query_scorer);
         assert_ne!(results.len(), 0);
 
-        if let Some(store) = f32_vectors.as_ref() {
-            let mut reranked = results
-                .par_iter()
-                .enumerate()
-                .map(|(i, n)| RerankedResult {
-                    result: Neighbor {
-                        id: n.id,
-                        score: EuclideanScorer.score(query, store.get(n.id as usize)),
-                    },
-                    rank: i as u32,
-                    approx_score: n.score,
-                })
-                .collect::<Vec<_>>();
-            reranked.sort();
-            let (ref mut rank_diff, ref mut count) = rerank_stats.get_or_insert((0, 0));
-            *count += reranked.len();
-            for (i, r) in reranked.iter().enumerate() {
-                *rank_diff += i.abs_diff(r.rank as usize);
-            }
-            results = reranked.into_iter().map(|e| e.result).collect();
-        };
+        if let Some(rr) = bit_reranker.as_mut() {
+            let query_scorer = F32xBitEuclideanQueryScorer::new(query);
+            results = rr.rerank(&results, &query_scorer);
+        }
+
+        if let Some(rr) = f32_reranker.as_mut() {
+            let query_scorer = DefaultQueryScorer::new(query, &EuclideanScorer);
+            results = rr.rerank(&results, &query_scorer);
+        }
 
         if let Some(recall_state) = recall_state.as_ref() {
             let (ref mut matched, ref mut total) = recall_stats.get_or_insert((0, 0));
@@ -462,12 +524,20 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         limit,
         progress.elapsed().div_f32(limit as f32).as_micros() as f64 / 1_000f64
     );
-    if let Some((rerank_diff, count)) = rerank_stats {
+    if let Some(rr) = bit_reranker.as_ref() {
         println!(
-            "result_count {} rerank_diff {} avg {:.2}",
-            count,
-            rerank_diff,
-            rerank_diff as f64 / count as f64
+            "bit rerank result_count {} rank_diff {} avg {:.2}",
+            rr.count(),
+            rr.rank_diff(),
+            rr.avg_rank_diff(),
+        );
+    }
+    if let Some(rr) = f32_reranker.as_ref() {
+        println!(
+            "f32 rerank result_count {} rank_diff {} avg {:.2}",
+            rr.count(),
+            rr.rank_diff(),
+            rr.avg_rank_diff(),
         );
     }
     if let Some((matched, total)) = recall_stats {
