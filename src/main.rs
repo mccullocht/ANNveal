@@ -1,6 +1,9 @@
+mod acorn_flat;
 mod quantization;
 mod scorer;
 mod store;
+#[cfg(test)]
+mod test;
 mod vamana;
 
 use std::{

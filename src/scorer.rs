@@ -4,6 +4,7 @@ use simsimd::{BinarySimilarity, SpatialSimilarity};
 /// Trait for scoring vectors against one another.
 pub trait VectorScorer {
     /// Type for the underlying vector data.
+    // XXX should this be Borrow? or AsRef?
     type Vector: ?Sized;
 
     /// Return the non-nan score of the two vectors. Larger values are better.
