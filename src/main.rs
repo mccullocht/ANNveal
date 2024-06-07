@@ -25,7 +25,10 @@ use store::{SliceFloatVectorStore, SliceU32VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
-    scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
+    scorer::{
+        DefaultQueryScorer, F32xBitEuclideanQueryScorer, F32xBitQuartileEuclideanQueryScorer,
+        HammingScorer,
+    },
     store::{SliceBitVectorStore, VectorStore},
     vamana::{GraphBuilder, ImmutableMemoryGraph},
 };
@@ -335,9 +338,9 @@ struct VamanaSearchArgs {
     /// Path to the binary vectors.
     #[arg(short, long)]
     bin_vectors: PathBuf,
-    /// Path to file containing the median vector for quantization.
+    /// Path to file containing the quantization quartile vectors
     #[arg(short, long)]
-    quantization_median: Option<PathBuf>,
+    quartile_vectors: Option<PathBuf>,
 
     /// Number of dimensions in input vectors.
     #[arg(short, long)]
@@ -446,7 +449,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         unsafe { memmap2::Mmap::map(&File::open(args.bin_vectors)?)? },
         args.dimensions,
     );
-    let quantization_median_vector_store = if let Some(p) = args.quantization_median {
+    let quartile_vector_store = if let Some(p) = args.quartile_vectors {
         Some(SliceFloatVectorStore::new(
             unsafe { memmap2::Mmap::map(&File::open(p)?)? },
             args.dimensions,
@@ -454,7 +457,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     } else {
         None
     };
-    let quantization_median = quantization_median_vector_store.as_ref().map(|s| s.get(0));
+    let quantization_median = quartile_vector_store.as_ref().map(|s| s.get(1));
     let f32_vectors = match args.f32_vectors {
         Some(vectors) => Some(SliceFloatVectorStore::new(
             unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
@@ -518,8 +521,18 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         assert_ne!(results.len(), 0);
 
         if let Some(rr) = bit_reranker.as_mut() {
-            let query_scorer = F32xBitEuclideanQueryScorer::new(query);
-            results = rr.rerank(&results, &query_scorer);
+            if let Some(quartile_vecs) = quartile_vector_store.as_ref() {
+                // XXX I have hosed myself on latency because I interleave the quartile vectors every time.
+                let query_scorer = F32xBitQuartileEuclideanQueryScorer::new(
+                    query,
+                    quartile_vecs.get(0),
+                    quartile_vecs.get(2),
+                );
+                results = rr.rerank(&results, &query_scorer);
+            } else {
+                let query_scorer = F32xBitEuclideanQueryScorer::new(query);
+                results = rr.rerank(&results, &query_scorer);
+            }
         }
 
         if let Some(rr) = f32_reranker.as_mut() {

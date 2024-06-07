@@ -124,3 +124,61 @@ impl<'a> QueryScorer for F32xBitEuclideanQueryScorer<'a> {
         NotNan::new(1.0 / (1.0 + dist)).unwrap()
     }
 }
+
+pub struct F32xBitQuartileEuclideanQueryScorer<'a> {
+    query: &'a [f32],
+    quartile_interleaved: Vec<f32>,
+}
+
+impl<'a> F32xBitQuartileEuclideanQueryScorer<'a> {
+    pub fn new(query: &'a [f32], quartile_lo: &[f32], quartile_hi: &[f32]) -> Self {
+        let mut quartile_interleaved = Vec::with_capacity(quartile_lo.len() * 2);
+        for (l, h) in quartile_lo.iter().zip(quartile_hi.iter()) {
+            quartile_interleaved.push(*l);
+            quartile_interleaved.push(*h);
+        }
+        Self {
+            query,
+            quartile_interleaved,
+        }
+    }
+}
+
+impl<'a> QueryScorer for F32xBitQuartileEuclideanQueryScorer<'a> {
+    type Vector = [u8];
+
+    fn score(&self, a: &Self::Vector) -> NotNan<f32> {
+        // TODO: consider using slice.array_chunks()
+        // TODO: simsimd may not be buying me all that much.
+        let bit_vec = a
+            .iter()
+            .map(|b| {
+                [
+                    b & 1,
+                    (b >> 1) & 1,
+                    (b >> 2) & 1,
+                    (b >> 3) & 1,
+                    (b >> 4) & 1,
+                    (b >> 5) & 1,
+                    (b >> 6) & 1,
+                    (b >> 7) & 1,
+                ]
+            })
+            .flatten();
+        let dequantized_vec = self
+            .quartile_interleaved
+            .chunks(2)
+            .zip(bit_vec)
+            .map(|(dq, i)| dq[i as usize]);
+        let dist: f32 = self
+            .query
+            .iter()
+            .zip(dequantized_vec)
+            .map(|(a, b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .sum();
+        NotNan::new(1.0 / (1.0 + dist)).unwrap()
+    }
+}
