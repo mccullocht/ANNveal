@@ -82,6 +82,7 @@ pub trait Graph {
     /// Return an iterate over the list of nodes neighboring `ord`.
     fn neighbors_iter(&self, i: usize) -> Self::NeighborEdgeIterator<'_>;
     /// Return the number of nodes in the graph.
+    #[allow(dead_code)]
     fn len(&self) -> usize;
 }
 

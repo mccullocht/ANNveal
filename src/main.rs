@@ -310,9 +310,6 @@ struct VamanaSearchArgs {
     /// Path to the binary vectors.
     #[arg(short, long)]
     bin_vectors: PathBuf,
-    /// If true, re-rank f32 query against binary vectors after retrieval completes.
-    #[arg(long, default_value_t = false)]
-    bit_rerank: bool,
     /// Path to the float32 vectors. If this is set we will re-rank the results.
     #[arg(short, long)]
     f32_vectors: Option<PathBuf>,
@@ -335,29 +332,17 @@ struct VamanaSearchArgs {
     /// Compute recall in top K results. Requires that --neighbors is also set.
     #[arg(short, long)]
     recall_k: Option<NonZeroUsize>,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct RerankedResult {
-    result: Neighbor,
-    rank: u32,
-    approx_score: NotNan<f32>,
-}
-
-impl Ord for RerankedResult {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.result.cmp(&other.result)
-    }
-}
-
-impl PartialOrd for RerankedResult {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+    /// Number of vectors to rerank using f32 x bit scoring.
+    #[arg(long)]
+    bit_rerank_budget: Option<usize>,
+    /// Number of vectors to rerank with f32 when --f32-vectors is set.
+    #[arg(long)]
+    f32_rerank_budget: Option<usize>,
 }
 
 struct Reranker<'a, B> {
     k: usize,
+    budget: usize,
     store: &'a B,
 
     rank_diff: usize,
@@ -368,9 +353,10 @@ impl<'a, B> Reranker<'a, B>
 where
     B: VectorStore + Send + Sync,
 {
-    fn new(k: usize, store: &'a B) -> Self {
+    fn new(k: usize, budget: usize, store: &'a B) -> Self {
         Self {
             k,
+            budget,
             store,
             rank_diff: 0,
             count: 0,
@@ -383,6 +369,7 @@ where
     {
         let mut reranked = results
             .into_par_iter()
+            .take(self.budget)
             .enumerate()
             .map(|(i, n)| {
                 (
@@ -398,10 +385,11 @@ where
         reranked
             .into_iter()
             .enumerate()
-            .take(self.k)
             .map(|(i, (r, n))| {
-                self.rank_diff += i.abs_diff(r);
-                self.count += 1;
+                if i < self.k {
+                    self.rank_diff += i.abs_diff(r);
+                    self.count += 1;
+                }
                 n
             })
             .collect()
@@ -450,17 +438,16 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         queries.len(),
     );
 
-    let recall_state = match (args.neighbors, args.recall_k) {
-        (Some(n), Some(k)) => Some(RecallState {
+    let recall_state = if let Some((p, k)) = args.neighbors.zip(args.recall_k) {
+        Some(RecallState {
             neighbors: SliceU32VectorStore::new(
-                unsafe { memmap2::Mmap::map(&File::open(n)?)? },
+                unsafe { memmap2::Mmap::map(&File::open(p)?)? },
                 NonZeroUsize::new(100).unwrap(),
             ),
             k: k.get(),
-        }),
-        (Some(_), None) => panic!("--neighbors set without --recall_k"),
-        (None, Some(_)) => panic!("--recall_k set without --neighbors"),
-        (None, None) => None,
+        })
+    } else {
+        None
     };
 
     let progress = ProgressBar::new(limit as u64)
@@ -473,12 +460,17 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let mut searcher = GraphSearcher::new(args.num_candidates);
     let mut bit_reranker = args
         .recall_k
-        .filter(|_| args.bit_rerank)
-        .map(|k| Reranker::new(k.get(), &bin_vectors));
-    let mut f32_reranker = f32_vectors
-        .as_ref()
-        .zip(args.recall_k)
-        .map(|(b, k)| Reranker::new(k.get(), b));
+        .zip(args.bit_rerank_budget)
+        .map(|(k, budget)| Reranker::new(k.get(), budget, &bin_vectors));
+    let mut f32_reranker = args
+        .recall_k
+        .zip(
+            args.f32_rerank_budget
+                .or(args.bit_rerank_budget)
+                .or(Some(args.num_candidates.get())),
+        )
+        .zip(f32_vectors.as_ref())
+        .map(|((k, budget), store)| Reranker::new(k.get(), budget, store));
     let mut recall_stats: Option<(usize, usize)> = None;
     for (i, query) in queries.iter().enumerate().take(limit) {
         let bin_query: Vec<u8> = binary_quantize_f32(query).collect();
