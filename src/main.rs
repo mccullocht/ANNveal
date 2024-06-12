@@ -13,18 +13,17 @@ use std::{
     str::FromStr,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
-use quantization::{binary_quantize_f32, ScalarQuantizer};
+use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
 use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
-use store::{SliceFloatVectorStore, SliceScalarQuantizedVectorStore, SliceU32VectorStore};
+use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStore, VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
     scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
-    store::{SliceBitVectorStore, VectorStore},
     vamana::{GraphBuilder, ImmutableMemoryGraph},
 };
 
@@ -129,9 +128,22 @@ struct QuantizeArgs {
     /// Number of dimensions in input vectors.
     #[arg(short, long)]
     dimensions: NonZeroUsize,
-    /// Number of bits to quantize to. Must be in 1..=8
+    /// Quantization algorithm to use.
     #[arg(short, long)]
-    bits: NonZeroUsize,
+    quantizer: QuantizerAlgorithm,
+    /// Number of bits to quantize to.
+    ///
+    /// When using scalar quantizer, must be in 2..=8.
+    #[arg(short, long)]
+    bits: Option<usize>,
+}
+
+#[derive(Clone, ValueEnum)]
+enum QuantizerAlgorithm {
+    /// Quantize each dimension into a single bit.
+    Binary,
+    /// Quantize each dimension into --bits linearly based on min and max values.
+    Scalar,
 }
 
 fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
@@ -147,28 +159,18 @@ fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
                 .unwrap(),
         )
         .with_finish(indicatif::ProgressFinish::AndLeave);
-    match args.bits.get() {
-        0 => unreachable!(),
-        1 => {
-            for fv in float_vector_store.iter() {
-                for b in binary_quantize_f32(fv) {
-                    vectors_out.write_all(std::slice::from_ref(&b))?;
-                }
-                progress.inc(1);
-            }
-        }
-        bits @ 2..=8 => {
-            let quantizer = ScalarQuantizer::from_store(&float_vector_store, bits);
-            let mut scratch = vec![0u8; quantizer.output_vector_len(args.dimensions.get())];
-            for fv in float_vector_store.iter() {
-                quantizer.quantize_vector(fv, &mut scratch);
-                vectors_out.write_all(&scratch)?;
-                progress.inc(1);
-            }
-            vectors_out.write_all(&quantizer.serialize())?;
-        }
-        _ => unimplemented!("Scalar quantization target must be <= 8 bits."),
+    let algo = match args.quantizer {
+        QuantizerAlgorithm::Binary => QuantizationAlgorithm::Binary,
+        QuantizerAlgorithm::Scalar => QuantizationAlgorithm::Scalar(args.bits.unwrap()),
+    };
+    let quantizer = Quantizer::from_store(algo, &float_vector_store, args.dimensions.get());
+    let mut buf = quantizer.quantization_buffer(args.dimensions.get());
+    for v in float_vector_store.iter() {
+        quantizer.quantize_to(v, &mut buf);
+        vectors_out.write_all(&buf)?;
+        progress.inc(1);
     }
+    quantizer.write_footer(&mut vectors_out)?;
     progress.finish_using_style();
     Ok(())
 }
@@ -188,12 +190,18 @@ fn search(args: SearchArgs) -> std::io::Result<()> {
         args.dimensions,
     );
     let bin_vector_store = match args.binary_vectors {
-        Some(p) => Some(SliceBitVectorStore::new(
+        Some(p) => Some(SliceQuantizedVectorStore::new(
             unsafe { memmap2::Mmap::map(&File::open(p)?)? },
             args.dimensions,
         )),
         None => None,
     };
+    if let Some(s) = bin_vector_store.as_ref() {
+        assert!(
+            s.quantizer().algorithm() == QuantizationAlgorithm::Binary
+                || s.quantizer().algorithm() == QuantizationAlgorithm::BinaryMean
+        );
+    }
     search_queries(
         &query_store,
         args.num_candidates,
@@ -250,7 +258,7 @@ fn binary_retrieve(
     num_candidates: usize,
     oversample: f32,
 ) -> Vec<Reverse<(NotNan<f32>, usize)>> {
-    let binary_query: Vec<u8> = binary_quantize_f32(query).collect();
+    let binary_query: Vec<u8> = Quantizer::new_binary_quantizer().quantize(query);
     let results = retrieve(
         binary_query.as_ref(),
         bin_store,
@@ -297,10 +305,11 @@ fn search_queries(
 
 fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     assert_eq!(args.coding, VectorCoding::Bin);
-    let store = SliceBitVectorStore::new(
+    let store = SliceQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
         args.dimensions,
     );
+    // XXX may need to alter the scorer per quantizer algorithm.
     let builder = GraphBuilder::new(
         args.max_degree,
         args.beam_width,
@@ -440,7 +449,7 @@ struct RecallState {
 fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let graph_backing = unsafe { memmap2::Mmap::map(&File::open(args.graph)?)? };
     let graph = ImmutableMemoryGraph::new(&graph_backing).unwrap();
-    let bin_vectors = SliceScalarQuantizedVectorStore::new(
+    let qvectors = SliceQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.bin_vectors)?)? },
         args.dimensions,
     );
@@ -485,7 +494,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let mut bit_reranker = args
         .recall_k
         .zip(args.bit_rerank_budget)
-        .map(|(k, budget)| Reranker::new(k.get(), budget, &bin_vectors));
+        .map(|(k, budget)| Reranker::new(k.get(), budget, &qvectors));
     let mut f32_reranker = args
         .recall_k
         .zip(
@@ -495,11 +504,13 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         )
         .zip(f32_vectors.as_ref())
         .map(|((k, budget), store)| Reranker::new(k.get(), budget, store));
+    let quantizer = qvectors.quantizer();
     let mut recall_stats: Option<(usize, usize)> = None;
     for (i, query) in queries.iter().enumerate().take(limit) {
-        let bin_query: Vec<u8> = binary_quantize_f32(query).collect();
+        // XXX scorer selection is a mess.
+        let bin_query: Vec<u8> = quantizer.quantize(query);
         let bin_query_scorer = DefaultQueryScorer::new(bin_query.as_ref(), &HammingScorer);
-        let mut results = searcher.search(&graph, &bin_vectors, &bin_query_scorer);
+        let mut results = searcher.search(&graph, &qvectors, &bin_query_scorer);
         assert_ne!(results.len(), 0);
 
         if let Some(rr) = bit_reranker.as_mut() {
