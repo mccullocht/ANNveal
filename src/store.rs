@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
+use crate::quantization::ScalarQuantizer;
+
 /// Dense store of vector data, analogous to a `Vec``.
 pub trait VectorStore {
     /// Type of the underlying vector data.
@@ -138,6 +140,62 @@ where
         }
 
         mean
+    }
+}
+
+#[derive(Debug)]
+pub struct SliceScalarQuantizedVectorStore<S> {
+    #[allow(dead_code)]
+    quantizer: ScalarQuantizer,
+    data: S,
+    stride: usize,
+    len: usize,
+}
+
+impl<S> SliceScalarQuantizedVectorStore<S>
+where
+    S: AsRef<[u8]>,
+{
+    pub fn new(data: S, dimensions: NonZeroUsize) -> Self {
+        let quantizer_state: [u8; 16] = data.as_ref()[(data.as_ref().len() - 16)..]
+            .try_into()
+            .unwrap();
+        let quantizer = ScalarQuantizer::deserialize(&quantizer_state);
+        let stride = quantizer.output_vector_len(dimensions.get());
+        assert_eq!((data.as_ref().len() - quantizer_state.len()) % stride, 0); // XXX improve error handling
+        let len = (data.as_ref().len() - quantizer_state.len()) / stride;
+        Self {
+            quantizer,
+            data,
+            stride,
+            len,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn quantizer(&self) -> &ScalarQuantizer {
+        &self.quantizer
+    }
+}
+
+impl<S> VectorStore for SliceScalarQuantizedVectorStore<S>
+where
+    S: AsRef<[u8]>,
+{
+    type Vector = [u8];
+
+    fn get(&self, i: usize) -> &Self::Vector {
+        let start = i * self.stride;
+        let end = start + self.stride;
+        return &self.data.as_ref()[start..end];
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn mean_vector(&self) -> Vec<u8> {
+        todo!()
     }
 }
 

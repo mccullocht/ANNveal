@@ -10,6 +10,7 @@ pub trait VectorScorer {
     fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32>;
 }
 
+/// A scorer that computes the hamming distance between two vectors.
 #[derive(Copy, Clone)]
 pub struct HammingScorer;
 
@@ -20,6 +21,54 @@ impl VectorScorer for HammingScorer {
         let dim = (a.len() * 8) as f32;
         let distance = BinarySimilarity::hamming(a, b).unwrap() as f32;
         NotNan::new((dim - distance) / dim).unwrap()
+    }
+}
+
+/// A scorer that computes the euclidean distance between two vectors of packed 2-bit elements.
+#[derive(Copy, Clone)]
+pub struct Int2EuclideanScorer;
+
+impl VectorScorer for Int2EuclideanScorer {
+    type Vector = [u8];
+
+    fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32> {
+        let distance: usize = a
+            .iter()
+            .zip(b.iter())
+            .map(|(a, b)| {
+                let d = [
+                    (a & 3).abs_diff(b & 3),
+                    ((a >> 2) & 3).abs_diff((b >> 2) & 3),
+                    ((a >> 4) & 3).abs_diff((b >> 4) & 3),
+                    (a >> 6).abs_diff(b >> 6),
+                ];
+                d.into_iter().map(|d| d * d).sum::<u8>() as usize
+            })
+            .sum();
+        NotNan::new(1.0 / (1.0 + distance as f32)).unwrap()
+    }
+}
+
+/// A scorer that computes the euclidean distance between two vectors of packed 2-bit elements.
+#[derive(Copy, Clone)]
+pub struct Int4EuclideanScorer;
+
+impl VectorScorer for Int4EuclideanScorer {
+    type Vector = [u8];
+
+    fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32> {
+        let distance: usize = a
+            .iter()
+            .zip(b.iter())
+            .map(|(a, b)| {
+                let d = [
+                    (a & 0xf).abs_diff(b & 0xf),
+                    ((a >> 4) & 0xf).abs_diff((b >> 4) & 0xf),
+                ];
+                d.into_iter().map(|d| d * d).sum::<u8>() as usize
+            })
+            .sum();
+        NotNan::new(1.0 / (1.0 + distance as f32)).unwrap()
     }
 }
 
@@ -124,3 +173,5 @@ impl<'a> QueryScorer for F32xBitEuclideanQueryScorer<'a> {
         NotNan::new(1.0 / (1.0 + dist)).unwrap()
     }
 }
+
+// XXX F32xInt2EuclideanQueryScorer

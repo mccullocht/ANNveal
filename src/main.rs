@@ -16,10 +16,10 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
-use quantization::binary_quantize_f32;
+use quantization::{binary_quantize_f32, ScalarQuantizer};
 use rayon::prelude::*;
 use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
-use store::{SliceFloatVectorStore, SliceU32VectorStore};
+use store::{SliceFloatVectorStore, SliceScalarQuantizedVectorStore, SliceU32VectorStore};
 use vamana::{GraphSearcher, Neighbor};
 
 use crate::{
@@ -37,21 +37,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Binary quantize an input vector file.
-    BinaryQuantize {
-        /// Path to input flat vector file.
-        #[arg(short, long)]
-        vectors: PathBuf,
-        /// Coding of vectors in input flat vector file.
-        #[arg(short, long)]
-        coding: VectorCoding,
-        /// Output path of binary coded vectors.
-        #[arg(short, long)]
-        output: PathBuf,
-        // Number of dimensions in input vectors.
-        #[arg(short, long)]
-        dimensions: NonZeroUsize,
-    },
+    /// Quantize an input vector file.
+    Quantize(QuantizeArgs),
     /// Search an input vector file using queries from another file.
     Search(SearchArgs),
     /// Build a Vamana vector index from an input flat vector file.
@@ -131,21 +118,58 @@ impl FromStr for VectorCoding {
     }
 }
 
-fn binary_quantize(
+#[derive(Args)]
+struct QuantizeArgs {
+    /// Path to input flat vector file.
+    #[arg(short, long)]
     vectors: PathBuf,
+    /// Output path of binary coded vectors.
+    #[arg(short, long)]
     output: PathBuf,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
     dimensions: NonZeroUsize,
-) -> std::io::Result<()> {
+    /// Number of bits to quantize to. Must be in 1..=8
+    #[arg(short, long)]
+    bits: NonZeroUsize,
+}
+
+fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
     let float_vector_store = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
-        dimensions,
+        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
+        args.dimensions,
     );
-    let mut vectors_out = BufWriter::new(File::create(output)?);
-    for fv in float_vector_store.iter() {
-        for b in binary_quantize_f32(fv) {
-            vectors_out.write_all(std::slice::from_ref(&b))?;
+    let mut vectors_out = BufWriter::new(File::create(args.output)?);
+    let progress = ProgressBar::new(float_vector_store.len() as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template("{wide_bar} {pos}/{len} ETA: {eta_precise} Elapsed: {elapsed_precise}")
+                .unwrap(),
+        )
+        .with_finish(indicatif::ProgressFinish::AndLeave);
+    match args.bits.get() {
+        0 => unreachable!(),
+        1 => {
+            for fv in float_vector_store.iter() {
+                for b in binary_quantize_f32(fv) {
+                    vectors_out.write_all(std::slice::from_ref(&b))?;
+                }
+                progress.inc(1);
+            }
         }
+        bits @ 2..=8 => {
+            let quantizer = ScalarQuantizer::from_store(&float_vector_store, bits);
+            let mut scratch = vec![0u8; quantizer.output_vector_len(args.dimensions.get())];
+            for fv in float_vector_store.iter() {
+                quantizer.quantize_vector(fv, &mut scratch);
+                vectors_out.write_all(&scratch)?;
+                progress.inc(1);
+            }
+            vectors_out.write_all(&quantizer.serialize())?;
+        }
+        _ => unimplemented!("Scalar quantization target must be <= 8 bits."),
     }
+    progress.finish_using_style();
     Ok(())
 }
 
@@ -416,7 +440,7 @@ struct RecallState {
 fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let graph_backing = unsafe { memmap2::Mmap::map(&File::open(args.graph)?)? };
     let graph = ImmutableMemoryGraph::new(&graph_backing).unwrap();
-    let bin_vectors = SliceBitVectorStore::new(
+    let bin_vectors = SliceScalarQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.bin_vectors)?)? },
         args.dimensions,
     );
@@ -541,12 +565,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
 fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
-        Commands::BinaryQuantize {
-            vectors,
-            coding: _,
-            output,
-            dimensions,
-        } => binary_quantize(vectors, output, dimensions),
+        Commands::Quantize(args) => quantize(args),
         Commands::Search(args) => search(args),
         Commands::VamanaBuild(args) => vamana_build(args),
         Commands::VamanaSearch(args) => vamana_search(args),
