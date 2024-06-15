@@ -12,7 +12,9 @@ pub enum QuantizationAlgorithm {
     Binary,
     /// Binary mean quantization. Map each dimension to 1 if > mean[dimension], else 0.
     BinaryMean,
-    // TODO: BinaryVariance(usize),
+    /// Statistical binary quantization. Map each dimension to one of bits + 1 dimensions and unary
+    /// encode the bucket number. Scoring may still be done with hamming distance.
+    StatisticalBinary(usize),
     /// Lucene-style scalar quantizer.
     ///
     /// Compute a min and max threshold within some confidence based on dimension, then map values
@@ -25,6 +27,7 @@ impl From<QuantizationAlgorithm> for u64 {
         match value {
             QuantizationAlgorithm::Binary => 0u64,
             QuantizationAlgorithm::BinaryMean => 1u64,
+            QuantizationAlgorithm::StatisticalBinary(bits) => 2u64 | ((bits as u64) << 32),
             QuantizationAlgorithm::Scalar(bits) => 16u64 | ((bits as u64) << 32),
         }
     }
@@ -38,6 +41,14 @@ impl TryFrom<u64> for QuantizationAlgorithm {
         match value {
             0 => Ok(QuantizationAlgorithm::Binary),
             1 => Ok(QuantizationAlgorithm::BinaryMean),
+            b if b & 0xff == 2 => {
+                let bits = (b >> 32) as usize;
+                if bits > 1 {
+                    Ok(QuantizationAlgorithm::StatisticalBinary(bits))
+                } else {
+                    Err(value)
+                }
+            }
             s if s & 0xff == 16 => {
                 let bits = (s >> 32) as usize;
                 if (2..=8).contains(&bits) {
@@ -54,8 +65,8 @@ impl TryFrom<u64> for QuantizationAlgorithm {
 #[derive(Debug)]
 enum QuantizerState {
     Binary,
-    #[allow(dead_code)]
     BinaryMean(Vec<f32>),
+    StatisticalBinary(StatisticalBinaryQuantizerState),
     Scalar(ScalarQuantizerState),
 }
 
@@ -64,9 +75,30 @@ impl QuantizerState {
         match self {
             QuantizerState::Binary => QuantizationAlgorithm::Binary,
             QuantizerState::BinaryMean(_) => QuantizationAlgorithm::BinaryMean,
+            QuantizerState::StatisticalBinary(state) => {
+                QuantizationAlgorithm::StatisticalBinary(state.bits)
+            }
             QuantizerState::Scalar(state) => QuantizationAlgorithm::Scalar(state.bits),
         }
     }
+}
+
+#[derive(Debug)]
+struct StatisticalBinaryQuantizerState {
+    dimensions: Vec<SBDimension>,
+    bits: usize,
+}
+
+impl StatisticalBinaryQuantizerState {
+    fn new(bits: usize, dimensions: Vec<SBDimension>) -> Self {
+        Self { dimensions, bits }
+    }
+}
+
+#[derive(Debug)]
+struct SBDimension {
+    mean: f32,
+    std_dev: f32,
 }
 
 #[derive(Debug)]
@@ -105,12 +137,46 @@ impl Quantizer {
     pub fn from_store(
         algo: QuantizationAlgorithm,
         store: &impl VectorStore<Vector = [f32]>,
-        _dimensions: usize,
+        dimensions: usize,
     ) -> Self {
         match algo {
             QuantizationAlgorithm::Binary => Self::new_binary_quantizer(),
             QuantizationAlgorithm::BinaryMean => {
-                todo!()
+                let mut means = vec![0f32; dimensions];
+                for (i, v) in SampleIterator::new(store).enumerate() {
+                    for (m, s) in means.iter_mut().zip(v.iter()) {
+                        *m = (s - *m) / (i + 1) as f32;
+                    }
+                }
+                Self {
+                    state: QuantizerState::BinaryMean(means),
+                }
+            }
+            QuantizationAlgorithm::StatisticalBinary(bits) => {
+                let mut means = vec![0f32; dimensions];
+                let mut m2s = vec![0f32; dimensions];
+                let iter = SampleIterator::new(store);
+                let count = iter.len();
+                for (i, v) in iter.enumerate() {
+                    for (s, (m, m2)) in v.iter().zip(means.iter_mut().zip(m2s.iter_mut())) {
+                        let delta = s - *m;
+                        *m += delta / (i + 1) as f32;
+                        *m2 += delta * (*s - *m);
+                    }
+                }
+                Self {
+                    state: QuantizerState::StatisticalBinary(StatisticalBinaryQuantizerState::new(
+                        bits,
+                        means
+                            .iter()
+                            .zip(m2s.iter())
+                            .map(|(mean, mean_squared)| SBDimension {
+                                mean: *mean,
+                                std_dev: (*mean_squared / count as f32).sqrt(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                }
             }
             QuantizationAlgorithm::Scalar(bits) => {
                 // XXX missing any notion of confidence
@@ -145,7 +211,7 @@ impl Quantizer {
     /// Returns the quantizer and number of bytes consumed from the end of the store, or an error
     /// if the data is invalid.
     pub fn read_footer(
-        _dimensions: usize,
+        dimensions: usize,
         reader: &mut (impl Read + Seek),
     ) -> std::io::Result<(Quantizer, usize)> {
         reader.seek(SeekFrom::End(-8))?;
@@ -154,7 +220,43 @@ impl Quantizer {
         let algo = QuantizationAlgorithm::try_from(u64::from_le_bytes(algo_buf)).unwrap();
         match algo {
             QuantizationAlgorithm::Binary => Ok((Self::new_binary_quantizer(), 8)),
-            QuantizationAlgorithm::BinaryMean => todo!(),
+            QuantizationAlgorithm::BinaryMean => {
+                let means_size = 4 * dimensions;
+                reader.seek(SeekFrom::Current(-(means_size as i64)))?;
+                let mut means = Vec::with_capacity(dimensions);
+                let mut buf = [0u8; 4];
+                for _ in 0..dimensions {
+                    reader.read_exact(&mut buf)?;
+                    means.push(f32::from_le_bytes(buf));
+                }
+                Ok((
+                    Self {
+                        state: QuantizerState::BinaryMean(means),
+                    },
+                    means_size + 8,
+                ))
+            }
+            QuantizationAlgorithm::StatisticalBinary(bits) => {
+                let dim_size = 8 * dimensions;
+                reader.seek(SeekFrom::Current(-(dim_size as i64)))?;
+                let mut dim = Vec::with_capacity(dimensions);
+                let mut buf = [0u8; 4];
+                for _ in 0..dimensions {
+                    reader.read_exact(&mut buf)?;
+                    let mean = f32::from_le_bytes(buf);
+                    reader.read_exact(&mut buf)?;
+                    let std_dev = f32::from_le_bytes(buf);
+                    dim.push(SBDimension { mean, std_dev });
+                }
+                Ok((
+                    Self {
+                        state: QuantizerState::StatisticalBinary(
+                            StatisticalBinaryQuantizerState::new(bits, dim),
+                        ),
+                    },
+                    dim_size + 8,
+                ))
+            }
             QuantizationAlgorithm::Scalar(bits) => {
                 let mut fbuf = [0u8; 4];
                 reader.seek(SeekFrom::Current(-8))?;
@@ -179,7 +281,17 @@ impl Quantizer {
     pub fn write_footer(&self, writer: &mut impl Write) -> std::io::Result<()> {
         match self.state {
             QuantizerState::Binary => {}
-            QuantizerState::BinaryMean(_) => todo!(),
+            QuantizerState::BinaryMean(ref means) => {
+                for m in means.iter() {
+                    writer.write_all(&m.to_le_bytes())?;
+                }
+            }
+            QuantizerState::StatisticalBinary(ref state) => {
+                for dim in state.dimensions.iter() {
+                    writer.write_all(&dim.mean.to_le_bytes())?;
+                    writer.write_all(&dim.std_dev.to_le_bytes())?;
+                }
+            }
             QuantizerState::Scalar(ref state) => {
                 writer.write_all(&state.min_quantile.to_le_bytes())?;
                 writer.write_all(&state.max_quantile.to_le_bytes())?;
@@ -219,6 +331,29 @@ impl Quantizer {
                         .filter_map(|(i, (d, m))| if *d > *m { Some(1u8 << i) } else { None })
                         .reduce(|a, b| a | b)
                         .unwrap_or(0u8)
+                }
+            }
+            QuantizerState::StatisticalBinary(state) => {
+                // TODO: when applied with 2 bits you get a value distribution split of 25-50-25.
+                // We might prefer an even split
+                out.fill(0u8);
+                let buckets = state.bits + 1;
+                for (i, (v, d)) in vector.iter().zip(state.dimensions.iter()).enumerate() {
+                    let start_bit = i * state.bits;
+                    // Map z scores between -2 and 2 to `buckets` values, which are then unary coded
+                    // into the output buffer.
+                    let zscore = (*v - d.mean) / d.std_dev;
+                    let bucket_float = (zscore + 2.0) / (4.0 / buckets as f32);
+                    let bucket = if bucket_float < 0.0 {
+                        0
+                    } else {
+                        std::cmp::min(bucket_float.floor() as usize, buckets - 1)
+                    };
+                    // This is pretty inefficient to handle cases where state.bits does not evenly
+                    // divide the length of a byte.
+                    for u in 0..bucket {
+                        out[(start_bit + u) / 8] |= 1u8 << ((start_bit + u) % 8);
+                    }
                 }
             }
             QuantizerState::Scalar(state) => {
@@ -276,12 +411,15 @@ impl Quantizer {
     pub fn element_bits(&self) -> usize {
         match &self.state {
             QuantizerState::Binary | QuantizerState::BinaryMean(_) => 1,
+            QuantizerState::StatisticalBinary(state) => state.bits,
             QuantizerState::Scalar(state) => state.bits.next_power_of_two(),
         }
     }
 }
 
-const MAX_SAMPLE_SIZE: usize = 32 << 10;
+/// XXX this should be adjustable by the algorithm. In practice ~1M is very cheap for sbq but with
+/// scalar with confidence intervals would likely be very expensive at this scale.
+const MAX_SAMPLE_SIZE: usize = 1 << 20;
 const RANDOM_SEED: u128 = 0xbeab3d60061ed00d;
 
 struct SampleIterator<'a, S> {
@@ -325,4 +463,10 @@ where
         let index = self.samples.next()?;
         Some(self.store.get(index))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.samples.size_hint()
+    }
 }
+
+impl<'a, S> ExactSizeIterator for SampleIterator<'a, S> where S: VectorStore<Vector = [f32]> {}

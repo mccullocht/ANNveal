@@ -10,7 +10,6 @@ use std::{
     io::{BufWriter, Write},
     num::NonZeroUsize,
     path::PathBuf,
-    str::FromStr,
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -47,77 +46,6 @@ enum Commands {
 }
 
 #[derive(Args)]
-struct SearchArgs {
-    /// Path to input query flat vector file.
-    #[arg(short, long)]
-    queries: PathBuf,
-    /// Number of queries to run. If unset, run all input queries.
-    #[arg(short, long)]
-    num_queries: Option<NonZeroUsize>,
-    /// Number of results to retrieve for each query.
-    #[arg(short, long)]
-    num_candidates: NonZeroUsize,
-    /// Path to input flat vector file.
-    #[arg(short, long)]
-    vectors: PathBuf,
-    /// Coding of vectors in input flat vector file.
-    #[arg(short, long)]
-    coding: VectorCoding,
-    /// Path to parallel flat vector file.
-    #[arg(short, long)]
-    binary_vectors: Option<PathBuf>,
-    /// Amount to oversample by when performing binary vector search.
-    /// By default no oversampling occurs.
-    #[arg(short, long, default_value_t = 1.0f32)]
-    oversample: f32,
-    // Number of dimensions in input vectors.
-    #[arg(short, long)]
-    dimensions: NonZeroUsize,
-}
-
-#[derive(Args)]
-struct VamanaBuildArgs {
-    /// Path to the input flat vector file.
-    #[arg(short, long)]
-    vectors: PathBuf,
-    /// Coding of vectors in input flat vector file.
-    #[arg(short, long)]
-    coding: VectorCoding,
-    /// Number of dimensions in input vectors.
-    #[arg(short, long)]
-    dimensions: NonZeroUsize,
-    /// Path to output vamana index file.
-    #[arg(short, long)]
-    index_file: PathBuf,
-    /// Maximum degree of each vertex in the vamana graph.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(32).unwrap())]
-    max_degree: NonZeroUsize,
-    /// Beam width for search during index build.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(200).unwrap())]
-    beam_width: NonZeroUsize,
-    /// Alpha value for pruning; must be >= 1.0
-    #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
-    alpha: NotNan<f32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VectorCoding {
-    F32,
-    Bin,
-}
-
-impl FromStr for VectorCoding {
-    type Err = &'static str;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "f32" => Ok(VectorCoding::F32),
-            "bin" => Ok(VectorCoding::Bin),
-            _ => Err("unknown vector coding format"),
-        }
-    }
-}
-
-#[derive(Args)]
 struct QuantizeArgs {
     /// Path to input flat vector file.
     #[arg(short, long)]
@@ -142,6 +70,8 @@ struct QuantizeArgs {
 enum QuantizerAlgorithm {
     /// Quantize each dimension into a single bit.
     Binary,
+    /// Quantize each dimension into --bits based on mean and standard deviation.
+    StatisticalBinary,
     /// Quantize each dimension into --bits linearly based on min and max values.
     Scalar,
 }
@@ -161,6 +91,11 @@ fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
         .with_finish(indicatif::ProgressFinish::AndLeave);
     let algo = match args.quantizer {
         QuantizerAlgorithm::Binary => QuantizationAlgorithm::Binary,
+        QuantizerAlgorithm::StatisticalBinary => match args.bits {
+            Some(m) if m == 1 => QuantizationAlgorithm::BinaryMean,
+            Some(b) => QuantizationAlgorithm::StatisticalBinary(b),
+            None => panic!("bits must be set"),
+        },
         QuantizerAlgorithm::Scalar => QuantizationAlgorithm::Scalar(args.bits.unwrap()),
     };
     let quantizer = Quantizer::from_store(algo, &float_vector_store, args.dimensions.get());
@@ -173,6 +108,32 @@ fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
     quantizer.write_footer(&mut vectors_out)?;
     progress.finish_using_style();
     Ok(())
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    /// Path to input query flat vector file.
+    #[arg(short, long)]
+    queries: PathBuf,
+    /// Number of queries to run. If unset, run all input queries.
+    #[arg(short, long)]
+    num_queries: Option<NonZeroUsize>,
+    /// Number of results to retrieve for each query.
+    #[arg(short, long)]
+    num_candidates: NonZeroUsize,
+    /// Path to input flat vector file.
+    #[arg(short, long)]
+    vectors: PathBuf,
+    /// Path to parallel flat vector file.
+    #[arg(short, long)]
+    binary_vectors: Option<PathBuf>,
+    /// Amount to oversample by when performing binary vector search.
+    /// By default no oversampling occurs.
+    #[arg(short, long, default_value_t = 1.0f32)]
+    oversample: f32,
+    // Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
 }
 
 fn search(args: SearchArgs) -> std::io::Result<()> {
@@ -303,8 +264,29 @@ fn search_queries(
     }
 }
 
+#[derive(Args)]
+struct VamanaBuildArgs {
+    /// Path to the input flat vector file.
+    #[arg(short, long)]
+    vectors: PathBuf,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZeroUsize,
+    /// Path to output vamana index file.
+    #[arg(short, long)]
+    index_file: PathBuf,
+    /// Maximum degree of each vertex in the vamana graph.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(32).unwrap())]
+    max_degree: NonZeroUsize,
+    /// Beam width for search during index build.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(200).unwrap())]
+    beam_width: NonZeroUsize,
+    /// Alpha value for pruning; must be >= 1.0
+    #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
+    alpha: NotNan<f32>,
+}
+
 fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
-    assert_eq!(args.coding, VectorCoding::Bin);
     let store = SliceQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
         args.dimensions,

@@ -135,6 +135,41 @@ where
 
         mean
     }
+
+    fn mean_statistical_binary_vector(&self, bits: usize) -> Vec<u8> {
+        // XXX FIXME _sample_ to compute the mean.
+        let num_dims = self.stride * 8 / bits;
+        let mut sums = vec![0u64; num_dims];
+        for v in self.iter() {
+            for (c, u) in v.chunks(8).enumerate() {
+                let mut word = if u.len() == 8 {
+                    u64::from_le_bytes(u.try_into().unwrap())
+                } else {
+                    let mut buf = [0u8; 8];
+                    buf[..u.len()].copy_from_slice(u);
+                    u64::from_le_bytes(buf)
+                };
+
+                while word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    sums[(c * 64 + bit) / bits] += 1;
+                    word ^= 1 << bit;
+                }
+            }
+        }
+        let mean_dims = sums
+            .into_iter()
+            .map(|s| (s as f64 / self.len() as f64).floor() as usize)
+            .collect::<Vec<_>>();
+        let mut mean_vector = self.quantizer.quantization_buffer(num_dims);
+        for (i, c) in mean_dims.into_iter().enumerate() {
+            let start_bit = i * bits;
+            for j in 0..c {
+                mean_vector[(start_bit + j) / 8] |= 1 << ((start_bit + j) % 8);
+            }
+        }
+        mean_vector
+    }
 }
 
 impl<S> VectorStore for SliceQuantizedVectorStore<S>
@@ -157,9 +192,12 @@ where
     where
         Self::Vector: ToOwned,
     {
-        match &self.quantizer.algorithm() {
+        match self.quantizer.algorithm() {
             QuantizationAlgorithm::Binary | QuantizationAlgorithm::BinaryMean => {
                 self.mean_binary_vector()
+            }
+            QuantizationAlgorithm::StatisticalBinary(bits) => {
+                self.mean_statistical_binary_vector(bits)
             }
             QuantizationAlgorithm::Scalar(_) => {
                 todo!()
@@ -207,7 +245,7 @@ where
     }
 
     fn mean_vector(&self) -> Vec<f32> {
-        todo!()
+        unimplemented!()
     }
 }
 
@@ -250,6 +288,6 @@ where
     }
 
     fn mean_vector(&self) -> Vec<u32> {
-        todo!()
+        unimplemented!()
     }
 }
