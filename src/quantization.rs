@@ -422,6 +422,7 @@ impl Quantizer {
 const MAX_SAMPLE_SIZE: usize = 1 << 20;
 const RANDOM_SEED: u128 = 0xbeab3d60061ed00d;
 
+// TODO: move this into store module and make it public.
 struct SampleIterator<'a, S> {
     store: &'a S,
     samples: std::vec::IntoIter<usize>,
@@ -433,10 +434,10 @@ impl<'a, S> SampleIterator<'a, S> {
         S: VectorStore<Vector = [f32]>,
     {
         if store.len() < MAX_SAMPLE_SIZE {
-            let samples = (0..store.len()).into_iter().collect::<Vec<_>>().into_iter();
+            let samples = (0..store.len()).collect::<Vec<_>>().into_iter();
             Self { store, samples }
         } else {
-            let mut reservoirs = (0..MAX_SAMPLE_SIZE).into_iter().collect::<Vec<_>>();
+            let mut reservoirs = (0..MAX_SAMPLE_SIZE).collect::<Vec<_>>();
             let mut rng = Pcg64Mcg::new(RANDOM_SEED);
             for i in reservoirs.len()..store.len() {
                 let j = rng.gen_range(0..(i + 1));

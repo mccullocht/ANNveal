@@ -181,7 +181,7 @@ where
     fn get(&self, i: usize) -> &Self::Vector {
         let start = i * self.stride;
         let end = start + self.stride;
-        return &self.data[start..end];
+        &self.data[start..end]
     }
 
     fn len(&self) -> usize {

@@ -5,6 +5,7 @@ use std::{
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
+    ops::{Index, Range},
     sync::{
         atomic::{AtomicU64, Ordering},
         RwLock, RwLockReadGuard,
@@ -23,7 +24,10 @@ use thread_local::ThreadLocal;
 use crate::{
     scorer::{DefaultQueryScorer, QueryScorer, VectorScorer},
     store::VectorStore,
+    utils::FixedBitSet,
 };
+
+// TODO: move graph traits and basic data structures to a graph module
 
 /// Information about a neighbor of a node.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -71,6 +75,113 @@ impl From<u64> for Neighbor {
     }
 }
 
+/// A sorted set of `Neighbor`s.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NeighborSet(Vec<Neighbor>);
+
+impl NeighborSet {
+    /// Return a new empty set.
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Return a new empty set with the given capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    pub(crate) fn from_sorted(n: Vec<Neighbor>) -> Self {
+        Self(n)
+    }
+
+    /// Return an iterator over the set.
+    pub fn iter(&self) -> std::slice::Iter<'_, Neighbor> {
+        self.0.iter()
+    }
+
+    /// Return the contents of the set as a slice.
+    pub fn as_slice(&self) -> &[Neighbor] {
+        self.0.as_slice()
+    }
+
+    /// Return the number of elements this set can fit without reallocation.
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Return the number of entries in this set.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return true if the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Insert a neighbor into the set. If the neighbor was inserted return its rank in the set,
+    /// otherwise return None.
+    /// NB: neighbors are only equivalent if they have the same id _and_ score.
+    pub fn insert(&mut self, n: Neighbor) -> Option<usize> {
+        if let Err(i) = self.0.binary_search(&n) {
+            self.0.insert(i, n);
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// Keep the selected neighbors and discard the rest.
+    pub(self) fn prune(&mut self, selected: &FixedBitSet) {
+        for (i, o) in selected.iter().zip(0..self.len()) {
+            self.0.swap(i, o);
+        }
+        self.0.truncate(selected.len())
+    }
+
+    /// Remove all entries from the set.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl Default for NeighborSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<NeighborSet> for Vec<Neighbor> {
+    fn from(value: NeighborSet) -> Self {
+        value.0
+    }
+}
+
+/// Convert a vector of neighbors to a `NeighborSet` by sorting it.
+impl From<Vec<Neighbor>> for NeighborSet {
+    fn from(mut value: Vec<Neighbor>) -> Self {
+        value.sort();
+        Self(value)
+    }
+}
+
+impl IntoIterator for NeighborSet {
+    type IntoIter = std::vec::IntoIter<Neighbor>;
+    type Item = Neighbor;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl Index<usize> for NeighborSet {
+    type Output = Neighbor;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
 /// Graph access.
 pub trait Graph {
     type NeighborEdgeIterator<'c>: Iterator<Item = usize>
@@ -84,6 +195,13 @@ pub trait Graph {
     /// Return the number of nodes in the graph.
     #[allow(dead_code)]
     fn len(&self) -> usize;
+}
+
+/// Edge pruning on a graph.
+trait EdgePruner {
+    /// Prune `edges`` based on policy defined by the pruner.
+    /// `first_unpruned` is the index of the first edges that has not been seen by the pruner.
+    fn prune(&self, first_unpruned: usize, edges: &mut NeighborSet);
 }
 
 #[derive(Debug)]
@@ -153,10 +271,6 @@ impl NeighborResultSet {
         Some(best.neighbor)
     }
 
-    fn to_results(&self) -> Vec<Neighbor> {
-        self.results.iter().map(|r| r.neighbor).collect()
-    }
-
     fn clear(&mut self) {
         self.results.clear();
         self.next_unvisited = 0;
@@ -173,7 +287,6 @@ impl From<NeighborResultSet> for Vec<Neighbor> {
 pub struct GraphSearcher {
     results: NeighborResultSet,
     seen: AHashSet<usize>,
-    visited: Vec<Neighbor>,
 }
 
 impl GraphSearcher {
@@ -182,44 +295,23 @@ impl GraphSearcher {
         Self {
             results: NeighborResultSet::new(k.into()),
             seen: AHashSet::new(),
-            visited: vec![],
         }
     }
 
     /// Search `graph` over vector `store` for `query` and return the `k` nearest neighbors in
     /// descending order by score.
-    pub fn search<G, V, Q>(&mut self, graph: &G, store: &V, query_scorer: &Q) -> Vec<Neighbor>
+    pub fn search<G, V, Q>(&mut self, graph: &G, store: &V, query_scorer: &Q) -> NeighborSet
     where
         G: Graph,
         Q: QueryScorer,
         V: VectorStore<Vector = Q::Vector>,
     {
-        self.search_internal(graph, store, query_scorer, false);
-        self.results.to_results()
+        self.search_internal(graph, store, query_scorer);
+        NeighborSet(self.results.results.iter().map(|r| r.neighbor).collect())
     }
 
-    /// Search `graph` over vector `store` for `query` using `scorer` to compute scores.
-    /// Access visited to view results in descending order by score.
-    fn search_for_insertion<G, V, Q, S>(&mut self, graph: &G, store: &V, scorer: &S, node: usize)
+    fn search_internal<G, V, Q>(&mut self, graph: &G, store: &V, query_scorer: &Q)
     where
-        G: Graph,
-        V: VectorStore<Vector = Q>,
-        Q: ?Sized,
-        S: VectorScorer<Vector = Q>,
-    {
-        self.seen.insert(node);
-        let query_scorer = DefaultQueryScorer::new(store.get(node), scorer);
-        self.search_internal(graph, store, &query_scorer, true);
-        self.visited.sort();
-    }
-
-    fn search_internal<G, V, Q>(
-        &mut self,
-        graph: &G,
-        store: &V,
-        query_scorer: &Q,
-        collect_visited: bool,
-    ) where
         G: Graph,
         Q: QueryScorer,
         V: VectorStore<Vector = Q::Vector>,
@@ -233,10 +325,6 @@ impl GraphSearcher {
         self.results.add((entry_point as u32, score).into());
 
         while let Some(candidate) = self.results.best_unvisited() {
-            if collect_visited {
-                self.visited.push(candidate);
-            }
-
             for neighbor_id in graph.neighbors_iter(candidate.id as usize) {
                 // skip candidates we've already visited.
                 if !self.seen.insert(neighbor_id) {
@@ -252,7 +340,6 @@ impl GraphSearcher {
     pub fn clear(&mut self) {
         self.results.clear();
         self.seen.clear();
-        self.visited.clear();
     }
 }
 
@@ -309,10 +396,28 @@ where
         }
     }
 
+    /// Add all nodes in `node_id_range` to the graph.
+    /// *Panics* if `node_id_range` is out of range.
+    #[allow(dead_code)]
+    pub fn add_nodes(&self, node_id_range: Range<usize>) {
+        self.add_nodes_with_progress(node_id_range, || {})
+    }
+
+    /// Add all nodes in `node_id_range` to the graph and call `progress` when each completes.
+    /// *Panics* if `node_id_range` is out of range.
+    pub fn add_nodes_with_progress<U>(&self, node_id_range: Range<usize>, progress: U)
+    where
+        U: Fn() + Send + Sync,
+    {
+        node_id_range.into_par_iter().for_each(|n| {
+            self.add_node(n);
+            progress();
+        })
+    }
+
     /// Add a single vector from the backing store.
-    ///
     /// *Panics* if `node` is out of range.
-    pub fn add_node(&self, node: usize) {
+    fn add_node(&self, node: usize) {
         assert!(node < self.store.len());
         let query = self.store.get(node);
         let centroid_neighbor = Neighbor::from((
@@ -331,75 +436,167 @@ where
         // Update the set of in-flight nodes to include this one. All in-flight nodes will be added
         // to the visited set to ensure we generate links.
         self.in_flight.insert(node);
+        // Initialize seen set with this node so don't score ourselves if a concurrent neighbor
+        // yields a pointer to use during a search. Similarly, add all other concurrent nodes to the
+        // result set so we don't accidentally omit them.
+        searcher.seen.insert(node);
         for n in self
             .in_flight
             .iter()
             .filter(|i| !i.is_removed() && *i.value() != node)
         {
-            searcher.visited.push(Neighbor::from((
+            searcher.results.add(Neighbor::from((
                 *n as u32,
                 self.scorer.score(query, self.store.get(*n)),
-            )))
+            )));
         }
-        searcher.search_for_insertion(&self.graph, self.store, &self.scorer, node);
-        searcher.visited.dedup();
-        let neighbors = self.robust_prune(&searcher.visited);
-        self.graph
-            .insert_neighbors(node, &neighbors, |unpruned| self.robust_prune(unpruned));
-        for n in neighbors {
-            self.graph.insert_neighbor(
-                n.id as usize,
-                Neighbor::from((node as u32, n.score)),
-                |unpruned| self.robust_prune(unpruned),
-            );
+        let query_scorer = DefaultQueryScorer::new(self.store.get(node), &self.scorer);
+        // The paper uses a "visisted" set instead of the result set here. The visited set is a
+        // super set of the result set and only has value if we think pruning would remove so many
+        // edges that we need several hundred additional nodes to properly saturate the graph. In
+        // practice this is not an issue.
+        let mut neighbors = searcher.search(&self.graph, self.store, &query_scorer);
+        self.prune(0, &mut neighbors);
+        for n in self.graph.insert_neighbors(node, neighbors, self) {
+            self.graph
+                .insert_neighbor(n.id as usize, Neighbor::from((node as u32, n.score)), self);
         }
 
         self.in_flight.remove(&node);
         self.graph.maybe_update_entry_point(centroid_neighbor);
     }
 
-    /// Wraps up graph building and prepares for search.
+    /// Finish graph construction and return the graph.
+    #[allow(dead_code)]
     pub fn finish(self) -> MutableGraph {
+        self.finish_with_progress(|| {})
+    }
+
+    /// Finish graph construction and return the graph.
+    pub fn finish_with_progress<U>(self, progress: U) -> MutableGraph
+    where
+        U: Fn() + Send + Sync,
+    {
         (0..self.store.len()).into_par_iter().for_each(|i| {
-            self.graph
-                .maybe_prune_neighbors(i, |unpruned| self.robust_prune(unpruned))
+            self.graph.maybe_prune_neighbors(i, &self);
+            progress();
         });
 
         self.graph
     }
+}
 
-    /// REQUIRES: neighbors is sorted in descending order by score.
-    fn robust_prune(&self, neighbors: &[Neighbor]) -> Vec<Neighbor> {
-        let mut prune_factor =
-            vec![NotNan::new(0.0f32).expect("not NaN constant"); neighbors.len()];
-        let mut pruned = Vec::with_capacity(self.max_degree);
+impl<'a, V, S, C> EdgePruner for GraphBuilder<'a, V, S, C>
+where
+    V: VectorStore + Sync + Send,
+    S: VectorScorer<Vector = V::Vector> + Sync + Send,
+    C: Send + Sync + Borrow<V::Vector>,
+    V::Vector: ToOwned<Owned = C>,
+{
+    /// Prune edges based on the RobustPrune algorithm in the paper.
+    ///
+    /// This should yield the same results as the algorithm in the paper but is optimized:
+    /// * Edges may be added to the list without immediately pruning; `first_unpruned` is the first
+    ///   such node added that way and we automatically include any nodes before this index.
+    /// * When considering the RNG rule for a candidate we consider the set of selected nodes
+    ///   instead the set of other potential candidates. This greatly reduces the amount of scoring
+    ///   we do since we only have to consider up to `max_degree` neighbors rather than `beam_width`
+    fn prune(&self, first_unpruned: usize, edges: &mut NeighborSet) {
+        // Create a selected set and initialize it with all the edges that have already been pruned.
+        let mut selected = FixedBitSet::new(edges.len());
+        for i in 0..first_unpruned {
+            selected.set(i);
+        }
+
         let mut cur_alpha = NotNan::new(1.0f32).expect("not NaN constant");
         let max_alpha = NotNan::new(self.alpha).expect("not NaN constant");
-        while cur_alpha <= max_alpha && pruned.len() < self.max_degree {
-            for (i, n) in neighbors.iter().enumerate() {
-                if pruned.len() >= self.max_degree {
-                    break;
-                }
-                if prune_factor[i] > max_alpha {
+        while cur_alpha <= max_alpha && selected.len() < self.max_degree {
+            for (i, n) in edges.iter().enumerate().skip(first_unpruned) {
+                if selected.get(i) {
                     continue;
                 }
-                prune_factor[i] = NotNan::new(f32::MAX).unwrap();
-                pruned.push(*n);
-                // Update prune factor for all subsequent neighbors.
+
                 let n_vector = self.store.get(n.id as usize);
-                for (j, o) in neighbors.iter().enumerate().skip(i + 1) {
-                    if prune_factor[j] > max_alpha {
-                        continue;
+                // Check if this vector is closer to any already selected neighbor than it is to
+                // the node itself. If it is not, then select this node.
+                if !selected
+                    .iter()
+                    .take_while(|a| *a < i)
+                    .any(|a| self.scorer.score(n_vector, self.store.get(a)) > n.score * cur_alpha)
+                {
+                    selected.set(i);
+                    if selected.len() >= self.max_degree {
+                        break;
                     }
-                    // This inverts the order from the paper because score metrics favor larger
-                    // values. This might still need tuning.
-                    let score_n_o = self.scorer.score(n_vector, self.store.get(o.id as usize));
-                    prune_factor[j] = prune_factor[j].max(score_n_o / o.score)
                 }
             }
+
             cur_alpha *= 1.2;
         }
-        pruned
+
+        edges.prune(&selected);
+    }
+}
+
+#[derive(Debug)]
+struct MutableGraphNode {
+    edges: NeighborSet,
+    first_unpruned: usize,
+}
+
+impl MutableGraphNode {
+    /// Create a new graph with the given edge capacity.
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            edges: NeighborSet::with_capacity(capacity),
+            first_unpruned: 0,
+        }
+    }
+
+    /// Add a neighbor to the edge list. Returns the number of edges on the node.
+    fn add_neighbor(&mut self, neighbor: Neighbor) -> usize {
+        if let Some(i) = self.edges.insert(neighbor) {
+            self.first_unpruned = std::cmp::min(self.first_unpruned, i);
+        }
+        self.len()
+    }
+
+    /// Add a set of neighbors to the edge list. Returns the number of edges on the node.
+    /// REQUIRES: `neighbors` is a pruned edge set.
+    fn add_neighbors(&mut self, mut neighbors: NeighborSet) -> usize {
+        if self.edges.len() < neighbors.len() {
+            // Try to merge the smaller set into the larger set.
+            std::mem::swap(&mut self.edges, &mut neighbors);
+            self.edges.0.shrink_to(neighbors.capacity());
+            self.first_unpruned = self.edges.len();
+        }
+
+        for n in neighbors {
+            if let Some(i) = self.edges.insert(n) {
+                self.first_unpruned = std::cmp::min(self.first_unpruned, i);
+            }
+        }
+
+        self.edges.len()
+    }
+
+    /// Run the pruner on this node.
+    fn prune(&mut self, pruner: &impl EdgePruner) {
+        pruner.prune(self.first_unpruned, &mut self.edges);
+        self.first_unpruned = self.edges.len();
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Neighbor> {
+        self.edges.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.edges.is_empty()
     }
 }
 
@@ -412,14 +609,14 @@ const INITIAL_ENTRY_POINT: Neighbor = Neighbor {
 pub struct MutableGraph {
     max_degree: usize,
     entry_point: AtomicU64,
-    nodes: Vec<RwLock<Vec<Neighbor>>>,
+    nodes: Vec<RwLock<MutableGraphNode>>,
 }
 
 impl MutableGraph {
     fn new(len: usize, max_degree: NonZeroUsize) -> Self {
         let mut nodes = Vec::with_capacity(len);
         nodes.resize_with(len, || {
-            RwLock::new(Vec::with_capacity(max_degree.get() * 2))
+            RwLock::new(MutableGraphNode::with_capacity(max_degree.get() * 2))
         });
         Self {
             max_degree: max_degree.get(),
@@ -454,50 +651,37 @@ impl MutableGraph {
         }
     }
 
-    fn insert_neighbor<P>(&self, node: usize, neighbor: Neighbor, prune: P)
+    fn insert_neighbor<P>(&self, node_id: usize, neighbor: Neighbor, pruner: &P)
     where
-        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+        P: EdgePruner,
     {
-        let mut edges = self.nodes[node].write().unwrap();
-        assert_ne!(node, neighbor.id as usize);
-        if let Err(index) = edges.binary_search(&neighbor) {
-            edges.insert(index, neighbor);
-            if edges.len() >= edges.capacity() {
-                let pruned = prune(&edges);
-                edges.clear();
-                edges.extend_from_slice(&pruned);
-            }
+        let mut node = self.nodes[node_id].write().unwrap();
+        assert_ne!(node_id, neighbor.id as usize);
+        if node.add_neighbor(neighbor) == self.max_degree * 2 {
+            node.prune(pruner);
         }
     }
 
-    fn insert_neighbors<P>(&self, node: usize, neighbors: &[Neighbor], prune: P)
+    /// Insert all of the neighbors in the set as edges on `node_id`, then prunes edges if needed.
+    /// Returns the set of neighbors after any pruning.
+    fn insert_neighbors<P>(&self, node_id: usize, neighbors: NeighborSet, pruner: &P) -> NeighborSet
     where
-        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+        P: EdgePruner,
     {
-        let mut edges = self.nodes[node].write().unwrap();
-        for n in neighbors {
-            // TODO we can use the last binary search index as a starting point, and if the value
-            // belongs at the end we could extend_from_slice instead of this.
-            if let Err(index) = edges.binary_search(n) {
-                edges.insert(index, *n);
-                if edges.len() >= edges.capacity() {
-                    let pruned = prune(&edges);
-                    edges.clear();
-                    edges.extend_from_slice(&pruned);
-                }
-            }
+        let mut node = self.nodes[node_id].write().unwrap();
+        if node.add_neighbors(neighbors) >= self.max_degree * 2 {
+            node.prune(pruner);
         }
+        node.edges.clone()
     }
 
-    fn maybe_prune_neighbors<P>(&self, node: usize, prune: P)
+    fn maybe_prune_neighbors<P>(&self, node_id: usize, pruner: &P)
     where
-        P: Fn(&[Neighbor]) -> Vec<Neighbor>,
+        P: EdgePruner,
     {
-        let mut edges = self.nodes[node].write().unwrap();
-        if edges.len() >= self.max_degree {
-            let pruned = prune(&edges);
-            edges.clear();
-            edges.extend_from_slice(&pruned);
+        let mut node = self.nodes[node_id].write().unwrap();
+        if node.len() >= self.max_degree {
+            node.prune(pruner);
         }
     }
 
@@ -524,16 +708,15 @@ impl MutableGraph {
 }
 
 pub struct NeighborNodeIterator<'a> {
-    guard: RwLockReadGuard<'a, Vec<Neighbor>>,
-    next: usize,
+    guard: RwLockReadGuard<'a, MutableGraphNode>,
+    it: Range<usize>,
 }
 
 impl<'a> NeighborNodeIterator<'a> {
-    fn new(neighbors: &'a RwLock<Vec<Neighbor>>) -> Self {
-        Self {
-            guard: neighbors.read().unwrap(),
-            next: 0,
-        }
+    fn new(neighbors: &'a RwLock<MutableGraphNode>) -> Self {
+        let guard = neighbors.read().unwrap();
+        let it = 0..guard.len();
+        Self { guard, it }
     }
 }
 
@@ -541,22 +724,11 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.guard.len() {
-            return None;
-        }
-
-        let i = self.next;
-        self.next += 1;
-        Some(self.guard[i].id as usize)
+        self.it.next().map(|i| self.guard.edges[i].id as usize)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = if self.next < self.guard.len() {
-            self.guard.len() - self.next
-        } else {
-            0
-        };
-        (size, Some(size))
+        self.it.size_hint()
     }
 }
 
@@ -778,7 +950,7 @@ mod test {
             store,
             Hamming64,
         );
-        (0..store.len()).into_par_iter().for_each(|i| {
+        (0..store.len()).into_par_iter().panic_fuse().for_each(|i| {
             builder.add_node(i);
         });
         builder.finish()

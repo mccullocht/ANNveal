@@ -1,6 +1,7 @@
 mod quantization;
 mod scorer;
 mod store;
+mod utils;
 mod vamana;
 
 use std::{
@@ -19,7 +20,7 @@ use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
 use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
 use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStore, VectorStore};
-use vamana::{GraphSearcher, Neighbor};
+use vamana::{GraphSearcher, Neighbor, NeighborSet};
 
 use crate::{
     scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
@@ -92,7 +93,7 @@ fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
     let algo = match args.quantizer {
         QuantizerAlgorithm::Binary => QuantizationAlgorithm::Binary,
         QuantizerAlgorithm::StatisticalBinary => match args.bits {
-            Some(m) if m == 1 => QuantizationAlgorithm::BinaryMean,
+            Some(1) => QuantizationAlgorithm::BinaryMean,
             Some(b) => QuantizationAlgorithm::StatisticalBinary(b),
             None => panic!("bits must be set"),
         },
@@ -286,12 +287,26 @@ struct VamanaBuildArgs {
     alpha: NotNan<f32>,
 }
 
+fn progress_bar(len: usize, message: &'static str) -> ProgressBar {
+    let progress = ProgressBar::new(len as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{msg} {wide_bar} {pos}/{len} ETA: {eta_precise} Elapsed: {elapsed_precise}",
+                )
+                .unwrap(),
+        )
+        .with_finish(indicatif::ProgressFinish::AndLeave);
+    progress.set_message(message);
+    progress
+}
+
 fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     let store = SliceQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
         args.dimensions,
     );
-    // XXX may need to alter the scorer per quantizer algorithm.
+    // TODO: allow building a vamana graph from a float vector store.
     let builder = GraphBuilder::new(
         args.max_degree,
         args.beam_width,
@@ -299,19 +314,14 @@ fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
         &store,
         HammingScorer,
     );
-    let progress = ProgressBar::new(store.len() as u64)
-        .with_style(
-            ProgressStyle::default_bar()
-                .template("{wide_bar} {pos}/{len} ETA: {eta_precise} Elapsed: {elapsed_precise}")
-                .unwrap(),
-        )
-        .with_finish(indicatif::ProgressFinish::AndLeave);
-    (0..store.len()).into_par_iter().for_each(|i| {
-        builder.add_node(i);
-        progress.inc(1);
-    });
+    let mut progress = progress_bar(store.len(), "build ");
+    builder.add_nodes_with_progress(0..store.len(), || progress.inc(1));
     progress.finish_using_style();
-    let graph = builder.finish();
+
+    progress = progress_bar(store.len(), "finish");
+    let graph = builder.finish_with_progress(|| progress.inc(1));
+    progress.finish_using_style();
+
     let mut w = BufWriter::new(File::create(args.index_file)?);
     graph.write(&mut w)?;
     Ok(())
@@ -378,11 +388,15 @@ where
         }
     }
 
-    fn rerank<Q>(&mut self, results: &Vec<Neighbor>, query_scorer: &Q) -> Vec<Neighbor>
+    fn rerank<Q>(&mut self, results: NeighborSet, query_scorer: &Q) -> NeighborSet
     where
         Q: QueryScorer<Vector = B::Vector> + Send + Sync,
     {
-        let mut reranked = results
+        // XXX this is fluent but does some unnecessary copying.
+        // if I record (id, rank) tuples after scoring and sorting then look up the diff from that.
+        // we'd still need NeighborSet::from_sorted() which is what I was hoping to avoid.
+
+        let mut reranked = Vec::from(results)
             .into_par_iter()
             .take(self.budget)
             .enumerate()
@@ -397,17 +411,19 @@ where
             })
             .collect::<Vec<_>>();
         reranked.sort_by_key(|r| r.1);
-        reranked
-            .into_iter()
-            .enumerate()
-            .map(|(i, (r, n))| {
-                if i < self.k {
-                    self.rank_diff += i.abs_diff(r);
-                    self.count += 1;
-                }
-                n
-            })
-            .collect()
+        NeighborSet::from_sorted(
+            reranked
+                .into_iter()
+                .enumerate()
+                .map(|(i, (r, n))| {
+                    if i < self.k {
+                        self.rank_diff += i.abs_diff(r);
+                        self.count += 1;
+                    }
+                    n
+                })
+                .collect(),
+        )
     }
 
     fn count(&self) -> usize {
@@ -497,12 +513,12 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
 
         if let Some(rr) = bit_reranker.as_mut() {
             let query_scorer = F32xBitEuclideanQueryScorer::new(query);
-            results = rr.rerank(&results, &query_scorer);
+            results = rr.rerank(results, &query_scorer);
         }
 
         if let Some(rr) = f32_reranker.as_mut() {
             let query_scorer = DefaultQueryScorer::new(query, &EuclideanScorer);
-            results = rr.rerank(&results, &query_scorer);
+            results = rr.rerank(results, &query_scorer);
         }
 
         if let Some(recall_state) = recall_state.as_ref() {
