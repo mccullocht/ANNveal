@@ -123,59 +123,6 @@ where
     }
 }
 
-/// Scores an f32 query vector against bit vectors.
-/// Remaps bit vectors into f32 space and scores for higher fidelity output.
-// XXX generalize this
-pub struct F32xBitEuclideanQueryScorer<'a> {
-    query: &'a [f32],
-}
-
-impl<'a> F32xBitEuclideanQueryScorer<'a> {
-    pub fn new(query: &'a [f32]) -> Self {
-        Self { query }
-    }
-}
-
-const DECODE_4_BITS: [[f32; 4]; 16] = [
-    [-1.0, -1.0, -1.0, -1.0],
-    [1.0, -1.0, -1.0, -1.0],
-    [-1.0, 1.0, -1.0, -1.0],
-    [1.0, 1.0, -1.0, -1.0],
-    [-1.0, -1.0, 1.0, -1.0],
-    [1.0, -1.0, 1.0, -1.0],
-    [-1.0, 1.0, 1.0, -1.0],
-    [1.0, 1.0, 1.0, -1.0],
-    [-1.0, -1.0, -1.0, 1.0],
-    [1.0, -1.0, -1.0, 1.0],
-    [-1.0, 1.0, -1.0, 1.0],
-    [1.0, 1.0, -1.0, 1.0],
-    [-1.0, -1.0, 1.0, 1.0],
-    [1.0, -1.0, 1.0, 1.0],
-    [-1.0, 1.0, 1.0, 1.0],
-    [1.0, 1.0, 1.0, 1.0],
-];
-
-impl<'a> QueryScorer for F32xBitEuclideanQueryScorer<'a> {
-    type Vector = [u8];
-
-    fn score(&self, a: &Self::Vector) -> NotNan<f32> {
-        // TODO: consider using slice.array_chunks()
-        // TODO: simsimd may not be buying me all that much.
-        let dist: f32 = self
-            .query
-            .chunks(8)
-            .zip(a)
-            .map(|(f, b)| {
-                let mut db = [0f32; 8];
-                db[0..4].copy_from_slice(&DECODE_4_BITS[*b as usize & 0xf]);
-                db[4..8].copy_from_slice(&DECODE_4_BITS[*b as usize >> 4]);
-                SpatialSimilarity::l2sq(f, &db).unwrap() as f32
-            })
-            .sum();
-        NotNan::new(1.0 / (1.0 + dist)).unwrap()
-    }
-}
-
 pub struct EuclideanDequantizeScorer<'a, 'b> {
     quantizer: &'a Quantizer,
     query: &'b [f32],

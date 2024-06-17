@@ -23,7 +23,7 @@ use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStor
 use vamana::{GraphSearcher, Neighbor, NeighborSet};
 
 use crate::{
-    scorer::{DefaultQueryScorer, F32xBitEuclideanQueryScorer, HammingScorer},
+    scorer::{DefaultQueryScorer, HammingScorer},
     vamana::{GraphBuilder, ImmutableMemoryGraph},
 };
 
