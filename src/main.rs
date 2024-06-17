@@ -18,7 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
-use scorer::{EuclideanScorer, QueryScorer, VectorScorer};
+use scorer::{EuclideanDequantizeScorer, EuclideanScorer, QueryScorer, VectorScorer};
 use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStore, VectorStore};
 use vamana::{GraphSearcher, Neighbor, NeighborSet};
 
@@ -512,7 +512,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         assert_ne!(results.len(), 0);
 
         if let Some(rr) = bit_reranker.as_mut() {
-            let query_scorer = F32xBitEuclideanQueryScorer::new(query);
+            let query_scorer = EuclideanDequantizeScorer::new(qvectors.quantizer(), query);
             results = rr.rerank(results, &query_scorer);
         }
 

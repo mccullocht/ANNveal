@@ -398,13 +398,13 @@ impl Quantizer {
             QuantizerState::Binary => {
                 for (b, o) in vector.iter().zip(out.chunks_mut(8)) {
                     o[0..4].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize & 0xf]);
-                    o[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[(*b as usize >> 4) & 0xf]);
+                    o[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize >> 4]);
                 }
             }
             QuantizerState::BinaryMean(means) => {
                 for (b, (mc, oc)) in vector.iter().zip(means.chunks(8).zip(out.chunks_mut(8))) {
                     oc[0..4].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize & 0xf]);
-                    oc[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[(*b as usize >> 4) & 0xf]);
+                    oc[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize >> 4]);
                     for (m, o) in mc.iter().zip(oc.iter_mut()) {
                         *o += *m;
                     }

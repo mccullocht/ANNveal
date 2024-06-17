@@ -1,6 +1,8 @@
 use ordered_float::NotNan;
 use simsimd::{BinarySimilarity, SpatialSimilarity};
 
+use crate::quantization::Quantizer;
+
 /// Trait for scoring vectors against one another.
 pub trait VectorScorer {
     /// Type for the underlying vector data.
@@ -174,4 +176,24 @@ impl<'a> QueryScorer for F32xBitEuclideanQueryScorer<'a> {
     }
 }
 
-// XXX F32xInt2EuclideanQueryScorer
+pub struct EuclideanDequantizeScorer<'a, 'b> {
+    quantizer: &'a Quantizer,
+    query: &'b [f32],
+}
+
+impl<'a, 'b> EuclideanDequantizeScorer<'a, 'b> {
+    pub fn new(quantizer: &'a Quantizer, query: &'b [f32]) -> Self {
+        Self { quantizer, query }
+    }
+}
+
+impl<'a, 'b> QueryScorer for EuclideanDequantizeScorer<'a, 'b> {
+    type Vector = [u8];
+
+    fn score(&self, a: &Self::Vector) -> NotNan<f32> {
+        // XXX this is deeply inefficient. we could probably dequantize chunks to avoid allcoation?
+        let mut doc = vec![0.0f32; self.query.len()];
+        self.quantizer.dequantize_to(a, &mut doc);
+        EuclideanScorer.score(self.query, &doc)
+    }
+}
