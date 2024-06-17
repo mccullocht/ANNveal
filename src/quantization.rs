@@ -392,6 +392,56 @@ impl Quantizer {
         }
     }
 
+    /// Lossy transform of a quantized vector back into a float vector.
+    pub fn dequantize_to(&self, vector: &[u8], out: &mut [f32]) {
+        match &self.state {
+            QuantizerState::Binary => {
+                for (b, o) in vector.iter().zip(out.chunks_mut(8)) {
+                    o[0..4].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize & 0xf]);
+                    o[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[(*b as usize >> 4) & 0xf]);
+                }
+            }
+            QuantizerState::BinaryMean(means) => {
+                for (b, (mc, oc)) in vector.iter().zip(means.chunks(8).zip(out.chunks_mut(8))) {
+                    oc[0..4].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize & 0xf]);
+                    oc[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[(*b as usize >> 4) & 0xf]);
+                    for (m, o) in mc.iter().zip(oc.iter_mut()) {
+                        *o += *m;
+                    }
+                }
+            }
+            QuantizerState::StatisticalBinary(state) => {
+                // XXX this could all be store in state
+                let stddev_bucket_span = 4.0 / (state.bits + 1) as f32;
+                let stddev_buckets: Vec<f32> = (0..(state.bits + 1))
+                    .map(|i| -2.0 + (stddev_bucket_span / 2.0) + (i as f32 * stddev_bucket_span))
+                    .collect();
+                for ((v, d), o) in (0..out.len())
+                    .map(|i| self.get_sbq_dimension(vector, i, state.bits))
+                    .zip(state.dimensions.iter())
+                    .zip(out.iter_mut())
+                {
+                    *o = d.mean + (stddev_buckets[v.trailing_ones() as usize] * d.std_dev);
+                }
+            }
+            QuantizerState::Scalar(_state) => todo!(),
+        }
+    }
+
+    fn get_sbq_dimension(&self, vector: &[u8], dimension: usize, bits: usize) -> u16 {
+        assert!(bits <= 8);
+        let start_bit = dimension * bits;
+        let src = &vector[(start_bit / 8)..];
+        let short = if src.len() > 1 {
+            let mut buf = [0u8; 2];
+            buf.copy_from_slice(&src[..2]);
+            u16::from_le_bytes(buf)
+        } else {
+            u16::from(src[0])
+        };
+        (short >> (start_bit % 8)) & ((1u16 << bits) - 1)
+    }
+
     /// Return the number of output bytes required to quantize a float vector `dimensions` long.
     pub fn quantized_bytes(&self, dimensions: usize) -> usize {
         ((dimensions * self.element_bits()) + 7) / 8
@@ -416,6 +466,25 @@ impl Quantizer {
         }
     }
 }
+
+const BINARY_DEQUANTIZE_4_BITS: [[f32; 4]; 16] = [
+    [-1.0, -1.0, -1.0, -1.0],
+    [1.0, -1.0, -1.0, -1.0],
+    [-1.0, 1.0, -1.0, -1.0],
+    [1.0, 1.0, -1.0, -1.0],
+    [-1.0, -1.0, 1.0, -1.0],
+    [1.0, -1.0, 1.0, -1.0],
+    [-1.0, 1.0, 1.0, -1.0],
+    [1.0, 1.0, 1.0, -1.0],
+    [-1.0, -1.0, -1.0, 1.0],
+    [1.0, -1.0, -1.0, 1.0],
+    [-1.0, 1.0, -1.0, 1.0],
+    [1.0, 1.0, -1.0, 1.0],
+    [-1.0, -1.0, 1.0, 1.0],
+    [1.0, -1.0, 1.0, 1.0],
+    [-1.0, 1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0, 1.0],
+];
 
 /// XXX this should be adjustable by the algorithm. In practice ~1M is very cheap for sbq but with
 /// scalar with confidence intervals would likely be very expensive at this scale.
