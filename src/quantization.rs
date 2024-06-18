@@ -222,11 +222,10 @@ impl ScalarQuantizerState {
     fn new(bits: usize, min_quantile: f32, max_quantile: f32) -> Self {
         let range = max_quantile - min_quantile;
         let divisor = (1usize << bits) - 1;
-        let scale = divisor as f32 / range;
         Self {
             min_quantile,
             max_quantile,
-            scale,
+            scale: divisor as f32 / range,
             bits,
         }
     }
@@ -343,6 +342,9 @@ impl Quantizer {
         reader.seek(SeekFrom::End(-8))?;
         let mut algo_buf = [0u8; 8];
         reader.read_exact(&mut algo_buf)?;
+        // Move the cursor back to the bytes before the header so that implementations can
+        // relative seek from that point.
+        reader.seek(SeekFrom::End(-8))?;
         let algo = QuantizationAlgorithm::try_from(u64::from_le_bytes(algo_buf)).unwrap();
         let result = match algo {
             QuantizationAlgorithm::Binary => Ok((QuantizerState::Binary, 0usize)),
@@ -425,13 +427,13 @@ impl Quantizer {
             QuantizerState::Binary => {
                 for (b, o) in vector.iter().zip(out.chunks_mut(8)) {
                     o[0..4].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize & 0xf]);
-                    o[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize >> 4]);
+                    o[4..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize >> 4]);
                 }
             }
             QuantizerState::BinaryMean(means) => {
                 for (b, (mc, oc)) in vector.iter().zip(means.chunks(8).zip(out.chunks_mut(8))) {
                     oc[0..4].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize & 0xf]);
-                    oc[5..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize >> 4]);
+                    oc[4..8].copy_from_slice(&BINARY_DEQUANTIZE_4_BITS[*b as usize >> 4]);
                     for (m, o) in mc.iter().zip(oc.iter_mut()) {
                         *o += *m;
                     }
