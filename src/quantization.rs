@@ -1,9 +1,15 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+    io::{Read, Seek, SeekFrom, Write},
+    slice,
+};
 
+use ordered_float::OrderedFloat;
 use rand::Rng;
 use rand_pcg::Pcg64Mcg;
 
 use crate::store::VectorStore;
+
+// TODO: move into a quantization module. sbq and scalar should have own files.
 
 /// A quantization algorithm to use on input f32 element vectors.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -101,7 +107,7 @@ impl StatisticalBinaryQuantizerState {
     ) -> Self {
         let mut means = vec![0f32; dimensions];
         let mut m2s = vec![0f32; dimensions];
-        let iter = SampleIterator::new(store);
+        let iter = SampleIterator::new(store, 1 << 20);
         let count = iter.len();
         for (i, v) in iter.enumerate() {
             for (s, (m, m2)) in v.iter().zip(means.iter_mut().zip(m2s.iter_mut())) {
@@ -210,11 +216,14 @@ struct SBDimension {
     std_dev: f32,
 }
 
+const SCALAR_QUANTILE_SCRATCH_SIZE: usize = 64;
+
 #[derive(Debug)]
 struct ScalarQuantizerState {
     min_quantile: f32,
     max_quantile: f32,
     scale: f32,
+    alpha: f32,
     bits: usize,
 }
 
@@ -226,21 +235,62 @@ impl ScalarQuantizerState {
             min_quantile,
             max_quantile,
             scale: divisor as f32 / range,
+            alpha: range / divisor as f32,
             bits,
         }
     }
 
-    fn from_store(bits: usize, store: &impl VectorStore<Vector = [f32]>) -> Self {
-        // XXX missing any notion of confidence
-        let mut min_quantile = f32::MAX;
-        let mut max_quantile = f32::MIN;
-        for v in SampleIterator::new(store) {
-            for d in v.iter() {
-                min_quantile = min_quantile.min(*d);
-                max_quantile = max_quantile.max(*d);
+    fn from_store(
+        bits: usize,
+        store: &impl VectorStore<Vector = [f32]>,
+        dimensions: usize,
+    ) -> Self {
+        let confidence = 1.0 - (1.0 / dimensions as f32);
+        let scratch_len = std::cmp::min(SCALAR_QUANTILE_SCRATCH_SIZE, store.len());
+        let mut batch = vec![OrderedFloat(0.0f32); scratch_len * dimensions];
+        let mut batch_index = 0usize;
+        let mut batch_count = 0usize;
+
+        // Average of min and max quantile across each batch.
+        let mut min_quantile = 0.0f64;
+        let mut max_quantile = 0.0f64;
+        for v in SampleIterator::new(store, 32 << 10) {
+            // Safety: OrderedFloat is repr(transparent)
+            let ov =
+                unsafe { slice::from_raw_parts(v.as_ptr() as *const OrderedFloat<f32>, v.len()) };
+            let batch_base = batch_index * dimensions;
+            batch[batch_base..(batch_base + dimensions)].copy_from_slice(ov);
+            batch_index += 1;
+            if batch_index == scratch_len {
+                let (min, max) = Self::get_quantiles(&mut batch, confidence);
+                batch_count += 1;
+                min_quantile += min as f64;
+                max_quantile += max as f64;
+                batch_index = 0;
             }
         }
-        Self::new(bits, min_quantile, max_quantile)
+        min_quantile /= batch_count as f64;
+        max_quantile /= batch_count as f64;
+        Self::new(bits, min_quantile as f32, max_quantile as f32)
+    }
+
+    // XXX OrderedFloat isn't necessarily sufficient. It may result in a a NaN upper quantile which
+    // is a whole world of hurt.
+    fn get_quantiles(mut samples: &mut [OrderedFloat<f32>], confidence: f32) -> (f32, f32) {
+        let quantile_index = (samples.len() as f32 * (1.0 - confidence) / 2.0 + 0.5) as usize;
+        if quantile_index > 0 {
+            samples.select_nth_unstable(quantile_index);
+            samples = &mut samples[quantile_index..];
+            samples.select_nth_unstable_by(quantile_index, |a, b| a.cmp(b).reverse());
+            samples = &mut samples[quantile_index..];
+        }
+        let mut min = OrderedFloat(f32::INFINITY);
+        let mut max = OrderedFloat(f32::NEG_INFINITY);
+        for s in samples {
+            min = std::cmp::min(*s, min);
+            max = std::cmp::max(*s, max);
+        }
+        (min.into(), max.into())
     }
 
     fn read_footer(reader: &mut (impl Read + Seek), bits: usize) -> std::io::Result<(Self, usize)> {
@@ -293,6 +343,10 @@ impl ScalarQuantizerState {
             _ => unreachable!(),
         }
     }
+
+    fn score_adjustment_multiplier(&self) -> f32 {
+        self.alpha * self.alpha
+    }
 }
 
 #[derive(Debug)]
@@ -314,7 +368,7 @@ impl Quantizer {
             QuantizationAlgorithm::Binary => QuantizerState::Binary,
             QuantizationAlgorithm::BinaryMean => {
                 let mut means = vec![0f32; dimensions];
-                for (i, v) in SampleIterator::new(store).enumerate() {
+                for (i, v) in SampleIterator::new(store, 1 << 20).enumerate() {
                     for (m, s) in means.iter_mut().zip(v.iter()) {
                         *m = (s - *m) / (i + 1) as f32;
                     }
@@ -325,7 +379,7 @@ impl Quantizer {
                 StatisticalBinaryQuantizerState::from_store(bits, store, dimensions),
             ),
             QuantizationAlgorithm::Scalar(bits) => {
-                QuantizerState::Scalar(ScalarQuantizerState::from_store(bits, store))
+                QuantizerState::Scalar(ScalarQuantizerState::from_store(bits, store, dimensions))
             }
         };
         Self { state }
@@ -467,6 +521,17 @@ impl Quantizer {
             QuantizerState::Scalar(state) => state.bits.next_power_of_two(),
         }
     }
+
+    /// Return a multiplier that can be used to adjust quantized scores into the same range as
+    /// typical float scores.
+    pub fn score_adjustment_multiplier(&self) -> f32 {
+        match &self.state {
+            QuantizerState::Binary
+            | QuantizerState::BinaryMean(_)
+            | QuantizerState::StatisticalBinary(_) => 1.0,
+            QuantizerState::Scalar(state) => state.score_adjustment_multiplier(),
+        }
+    }
 }
 
 const BINARY_DEQUANTIZE_4_BITS: [[f32; 4]; 16] = [
@@ -488,9 +553,6 @@ const BINARY_DEQUANTIZE_4_BITS: [[f32; 4]; 16] = [
     [1.0, 1.0, 1.0, 1.0],
 ];
 
-/// XXX this should be adjustable by the algorithm. In practice ~1M is very cheap for sbq but with
-/// scalar with confidence intervals would likely be very expensive at this scale.
-const MAX_SAMPLE_SIZE: usize = 1 << 20;
 const RANDOM_SEED: u128 = 0xbeab3d60061ed00d;
 
 // TODO: move this into store module and make it public.
@@ -500,15 +562,15 @@ struct SampleIterator<'a, S> {
 }
 
 impl<'a, S> SampleIterator<'a, S> {
-    fn new(store: &'a S) -> Self
+    fn new(store: &'a S, max_sample_size: usize) -> Self
     where
         S: VectorStore<Vector = [f32]>,
     {
-        if store.len() < MAX_SAMPLE_SIZE {
+        if store.len() < max_sample_size {
             let samples = (0..store.len()).collect::<Vec<_>>().into_iter();
             Self { store, samples }
         } else {
-            let mut reservoirs = (0..MAX_SAMPLE_SIZE).collect::<Vec<_>>();
+            let mut reservoirs = (0..max_sample_size).collect::<Vec<_>>();
             let mut rng = Pcg64Mcg::new(RANDOM_SEED);
             for i in reservoirs.len()..store.len() {
                 let j = rng.gen_range(0..(i + 1));

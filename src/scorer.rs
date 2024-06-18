@@ -1,3 +1,5 @@
+use std::slice;
+
 use ordered_float::NotNan;
 use simsimd::{BinarySimilarity, SpatialSimilarity};
 
@@ -26,7 +28,7 @@ impl VectorScorer for HammingScorer {
     }
 }
 
-/// A scorer that computes the euclidean distance between two vectors of packed 2-bit elements.
+/// A scorer that computes the euclidean distance between two vectors of packed 2 bit elements.
 #[derive(Copy, Clone)]
 pub struct Int2EuclideanScorer;
 
@@ -51,7 +53,7 @@ impl VectorScorer for Int2EuclideanScorer {
     }
 }
 
-/// A scorer that computes the euclidean distance between two vectors of packed 2-bit elements.
+/// A scorer that computes the euclidean distance between two vectors of packed 3-4 bit elements.
 #[derive(Copy, Clone)]
 pub struct Int4EuclideanScorer;
 
@@ -71,6 +73,34 @@ impl VectorScorer for Int4EuclideanScorer {
             })
             .sum();
         NotNan::new(1.0 / (1.0 + distance as f32)).unwrap()
+    }
+}
+
+/// A scorer that computes the euclidean distance between two vectors of 5-7 bit elements.
+#[derive(Copy, Clone)]
+pub struct Int7EuclideanScorer(f32);
+
+#[allow(dead_code)]
+impl Int7EuclideanScorer {
+    pub fn new(quantizer: &Quantizer) -> Self {
+        Self(quantizer.score_adjustment_multiplier())
+    }
+}
+
+impl VectorScorer for Int7EuclideanScorer {
+    type Vector = [u8];
+
+    // XXX we want the const multiplier from lucene to make these scores more....reasonable.
+    // right now it's all low precision
+    fn score(&self, a: &Self::Vector, b: &Self::Vector) -> NotNan<f32> {
+        let distance = unsafe {
+            SpatialSimilarity::l2sq(
+                slice::from_raw_parts(a.as_ptr() as *const i8, a.len()),
+                slice::from_raw_parts(b.as_ptr() as *const i8, b.len()),
+            )
+            .unwrap()
+        };
+        NotNan::new(1.0 / (1.0 + (distance as f32 * self.0))).unwrap()
     }
 }
 

@@ -59,6 +59,8 @@ where
     }
 }
 
+// XXX more generally I could compute a mean float vector when *quantizing* and write it into the
+// store the mean vector could then I could delete much of this implementation.
 #[derive(Debug)]
 pub struct SliceQuantizedVectorStore<S> {
     data: S,
@@ -170,6 +172,69 @@ where
         }
         mean_vector
     }
+
+    fn mean_scalar_vector(&self, mut bits: usize) -> Vec<u8> {
+        bits = bits.next_power_of_two();
+        let dims = self.stride * 8 / bits;
+        let mut sums = vec![0u64; dims];
+        for v in self.iter() {
+            match bits {
+                2 => {
+                    for (i, o) in v
+                        .iter()
+                        .flat_map(|d| {
+                            [*d & 0x3, (*d >> 2) & 0x3, (*d >> 4) & 0x3, *d >> 6].into_iter()
+                        })
+                        .zip(sums.iter_mut())
+                    {
+                        *o += i as u64;
+                    }
+                }
+                4 => {
+                    for (i, o) in v
+                        .iter()
+                        .flat_map(|d| [*d & 0xf, *d >> 4].into_iter())
+                        .zip(sums.iter_mut())
+                    {
+                        *o += i as u64;
+                    }
+                }
+                8 => {
+                    for (i, o) in v.iter().copied().zip(sums.iter_mut()) {
+                        *o += i as u64;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        match bits {
+            2 => sums
+                .chunks(4)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(i, s)| ((*s as f64 / self.len() as f64).round() as u8) << (i * 2))
+                        .reduce(|a, b| a | b)
+                        .unwrap_or(0u8)
+                })
+                .collect::<Vec<_>>(),
+            4 => sums
+                .chunks(2)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(i, s)| ((*s as f64 / self.len() as f64).round() as u8) << (i * 4))
+                        .reduce(|a, b| a | b)
+                        .unwrap_or(0u8)
+                })
+                .collect::<Vec<_>>(),
+            8 => sums
+                .into_iter()
+                .map(|s| (s as f64 / self.len() as f64).round() as u8)
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl<S> VectorStore for SliceQuantizedVectorStore<S>
@@ -199,9 +264,7 @@ where
             QuantizationAlgorithm::StatisticalBinary(bits) => {
                 self.mean_statistical_binary_vector(bits)
             }
-            QuantizationAlgorithm::Scalar(_) => {
-                todo!()
-            }
+            QuantizationAlgorithm::Scalar(bits) => self.mean_scalar_vector(bits),
         }
     }
 }
