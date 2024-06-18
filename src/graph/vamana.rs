@@ -5,7 +5,7 @@ use std::{
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
-    ops::{Index, Range},
+    ops::Range,
     sync::{
         atomic::{AtomicU64, Ordering},
         RwLock, RwLockReadGuard,
@@ -22,188 +22,13 @@ use rayon::{
 use thread_local::ThreadLocal;
 
 use crate::{
+    graph::{EdgePruner, Graph, Neighbor, NeighborSet},
     scorer::{DefaultQueryScorer, QueryScorer, VectorScorer},
     store::VectorStore,
     utils::FixedBitSet,
 };
 
-// TODO: move graph traits and basic data structures to a graph module
-
-/// Information about a neighbor of a node.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Neighbor {
-    pub id: u32,
-    pub score: NotNan<f32>,
-}
-
-impl From<(u32, NotNan<f32>)> for Neighbor {
-    fn from(value: (u32, NotNan<f32>)) -> Self {
-        Self {
-            id: value.0,
-            score: value.1,
-        }
-    }
-}
-
-impl Ord for Neighbor {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score
-            .cmp(&other.score)
-            .reverse()
-            .then(self.id.cmp(&other.id))
-    }
-}
-
-impl PartialOrd for Neighbor {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl From<Neighbor> for u64 {
-    fn from(value: Neighbor) -> Self {
-        (u64::from(value.score.to_bits()) << 32) | u64::from(value.id)
-    }
-}
-
-impl From<u64> for Neighbor {
-    fn from(value: u64) -> Self {
-        Neighbor {
-            id: value as u32,
-            score: NotNan::new(f32::from_bits((value >> 32) as u32)).unwrap(),
-        }
-    }
-}
-
-/// A sorted set of `Neighbor`s.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NeighborSet(Vec<Neighbor>);
-
-impl NeighborSet {
-    /// Return a new empty set.
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    /// Return a new empty set with the given capacity.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
-    }
-
-    pub(crate) fn from_sorted(n: Vec<Neighbor>) -> Self {
-        Self(n)
-    }
-
-    /// Return an iterator over the set.
-    pub fn iter(&self) -> std::slice::Iter<'_, Neighbor> {
-        self.0.iter()
-    }
-
-    /// Return the contents of the set as a slice.
-    pub fn as_slice(&self) -> &[Neighbor] {
-        self.0.as_slice()
-    }
-
-    /// Return the number of elements this set can fit without reallocation.
-    pub fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-
-    /// Return the number of entries in this set.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Return true if the set is empty.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Insert a neighbor into the set. If the neighbor was inserted return its rank in the set,
-    /// otherwise return None.
-    /// NB: neighbors are only equivalent if they have the same id _and_ score.
-    pub fn insert(&mut self, n: Neighbor) -> Option<usize> {
-        if let Err(i) = self.0.binary_search(&n) {
-            self.0.insert(i, n);
-            Some(i)
-        } else {
-            None
-        }
-    }
-
-    /// Keep the selected neighbors and discard the rest.
-    pub(self) fn prune(&mut self, selected: &FixedBitSet) {
-        for (i, o) in selected.iter().zip(0..self.len()) {
-            self.0.swap(i, o);
-        }
-        self.0.truncate(selected.len())
-    }
-
-    /// Remove all entries from the set.
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-impl Default for NeighborSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl From<NeighborSet> for Vec<Neighbor> {
-    fn from(value: NeighborSet) -> Self {
-        value.0
-    }
-}
-
-/// Convert a vector of neighbors to a `NeighborSet` by sorting it.
-impl From<Vec<Neighbor>> for NeighborSet {
-    fn from(mut value: Vec<Neighbor>) -> Self {
-        value.sort();
-        Self(value)
-    }
-}
-
-impl IntoIterator for NeighborSet {
-    type IntoIter = std::vec::IntoIter<Neighbor>;
-    type Item = Neighbor;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-impl Index<usize> for NeighborSet {
-    type Output = Neighbor;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.0[index]
-    }
-}
-
-/// Graph access.
-pub trait Graph {
-    type NeighborEdgeIterator<'c>: Iterator<Item = usize>
-    where
-        Self: 'c;
-
-    // Returns the entry point to the graph if any nodes have been populated.
-    fn entry_point(&self) -> Option<usize>;
-    /// Return an iterate over the list of nodes neighboring `ord`.
-    fn neighbors_iter(&self, i: usize) -> Self::NeighborEdgeIterator<'_>;
-    /// Return the number of nodes in the graph.
-    #[allow(dead_code)]
-    fn len(&self) -> usize;
-}
-
-/// Edge pruning on a graph.
-trait EdgePruner {
-    /// Prune `edges`` based on policy defined by the pruner.
-    /// `first_unpruned` is the index of the first edges that has not been seen by the pruner.
-    fn prune(&self, first_unpruned: usize, edges: &mut NeighborSet);
-}
-
+/// A `Neighbor` annotated with an additional bit to indicate if it has been visited yet.
 #[derive(Debug)]
 struct NeighborResult {
     neighbor: Neighbor,
@@ -219,6 +44,11 @@ impl From<Neighbor> for NeighborResult {
     }
 }
 
+/// An ordered set of `NeighborResult`s as a hybrid priority queue.
+///
+/// Results are ordered by `Neighbor` value and the set is capped to a fixed capacity. This queue
+/// also has a mechansim to read the best unvisited neighbor, a core part of the Vamana search
+/// algorithm.
 #[derive(Debug)]
 struct NeighborResultSet {
     results: Vec<NeighborResult>,
@@ -866,8 +696,8 @@ mod test {
     use ordered_float::NotNan;
 
     use crate::{
+        graph::Graph,
         scorer::{DefaultQueryScorer, VectorScorer},
-        vamana::Graph,
     };
 
     use rayon::prelude::*;

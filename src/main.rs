@@ -1,12 +1,10 @@
+mod graph;
 mod quantization;
 mod scorer;
 mod store;
 mod utils;
-mod vamana;
 
 use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
     fs::File,
     io::{BufWriter, Write},
     num::NonZeroUsize,
@@ -14,18 +12,18 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use graph::{
+    vamana::{GraphBuilder, GraphSearcher, ImmutableMemoryGraph},
+    Neighbor, NeighborSet,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
-use scorer::{EuclideanDequantizeScorer, EuclideanScorer, QueryScorer, VectorScorer};
+use scorer::{EuclideanDequantizeScorer, EuclideanScorer, QueryScorer};
 use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStore, VectorStore};
-use vamana::{GraphSearcher, Neighbor, NeighborSet};
 
-use crate::{
-    scorer::{DefaultQueryScorer, HammingScorer},
-    vamana::{GraphBuilder, ImmutableMemoryGraph},
-};
+use crate::scorer::{DefaultQueryScorer, HammingScorer};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -38,8 +36,6 @@ struct Cli {
 enum Commands {
     /// Quantize an input vector file.
     Quantize(QuantizeArgs),
-    /// Search an input vector file using queries from another file.
-    Search(SearchArgs),
     /// Build a Vamana vector index from an input flat vector file.
     VamanaBuild(VamanaBuildArgs),
     /// Search a Vamana vector index stored on disk.
@@ -109,160 +105,6 @@ fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
     quantizer.write_footer(&mut vectors_out)?;
     progress.finish_using_style();
     Ok(())
-}
-
-#[derive(Args)]
-struct SearchArgs {
-    /// Path to input query flat vector file.
-    #[arg(short, long)]
-    queries: PathBuf,
-    /// Number of queries to run. If unset, run all input queries.
-    #[arg(short, long)]
-    num_queries: Option<NonZeroUsize>,
-    /// Number of results to retrieve for each query.
-    #[arg(short, long)]
-    num_candidates: NonZeroUsize,
-    /// Path to input flat vector file.
-    #[arg(short, long)]
-    vectors: PathBuf,
-    /// Path to parallel flat vector file.
-    #[arg(short, long)]
-    binary_vectors: Option<PathBuf>,
-    /// Amount to oversample by when performing binary vector search.
-    /// By default no oversampling occurs.
-    #[arg(short, long, default_value_t = 1.0f32)]
-    oversample: f32,
-    // Number of dimensions in input vectors.
-    #[arg(short, long)]
-    dimensions: NonZeroUsize,
-}
-
-fn search(args: SearchArgs) -> std::io::Result<()> {
-    let query_store = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(args.queries)?)? },
-        args.dimensions,
-    );
-    let limit = args
-        .num_queries
-        .map(NonZeroUsize::get)
-        .unwrap_or(query_store.len());
-
-    let vector_store = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
-        args.dimensions,
-    );
-    let bin_vector_store = match args.binary_vectors {
-        Some(p) => Some(SliceQuantizedVectorStore::new(
-            unsafe { memmap2::Mmap::map(&File::open(p)?)? },
-            args.dimensions,
-        )),
-        None => None,
-    };
-    if let Some(s) = bin_vector_store.as_ref() {
-        assert!(
-            s.quantizer().algorithm() == QuantizationAlgorithm::Binary
-                || s.quantizer().algorithm() == QuantizationAlgorithm::BinaryMean
-        );
-    }
-    search_queries(
-        &query_store,
-        args.num_candidates,
-        limit,
-        &vector_store,
-        bin_vector_store.as_ref(),
-        args.oversample,
-    );
-    Ok(())
-}
-
-/// Retrieve num_candidates for query in store and return the result in any order.
-fn retrieve<V, B, S>(
-    query: &V,
-    store: &B,
-    scorer: &S,
-    num_candidates: usize,
-) -> Vec<Reverse<(NotNan<f32>, usize)>>
-where
-    V: ?Sized,
-    B: VectorStore<Vector = V>,
-    S: VectorScorer<Vector = V>,
-{
-    let mut heap: BinaryHeap<Reverse<(NotNan<f32>, usize)>> =
-        BinaryHeap::with_capacity(num_candidates + 1);
-    for (i, v) in store.iter().enumerate() {
-        let score = scorer.score(query, v);
-        if heap.len() >= num_candidates {
-            if score > heap.peek().unwrap().0 .0 {
-                heap.pop();
-            } else {
-                continue;
-            }
-        }
-        heap.push(Reverse((score, i)));
-    }
-    heap.into_vec()
-}
-
-fn full_retrieve(
-    query: &[f32],
-    store: &impl VectorStore<Vector = [f32]>,
-    num_candidates: usize,
-) -> Vec<Reverse<(NotNan<f32>, usize)>> {
-    let mut results = retrieve(query, store, &EuclideanScorer, num_candidates);
-    results.sort();
-    results
-}
-
-fn binary_retrieve(
-    query: &[f32],
-    store: &impl VectorStore<Vector = [f32]>,
-    bin_store: &impl VectorStore<Vector = [u8]>,
-    num_candidates: usize,
-    oversample: f32,
-) -> Vec<Reverse<(NotNan<f32>, usize)>> {
-    let binary_query: Vec<u8> = Quantizer::new_binary_quantizer().quantize(query);
-    let results = retrieve(
-        binary_query.as_ref(),
-        bin_store,
-        &HammingScorer,
-        (num_candidates as f32 * oversample) as usize,
-    );
-    let mut full_results: Vec<Reverse<(NotNan<f32>, usize)>> = results
-        .into_iter()
-        .map(|e| Reverse((EuclideanScorer.score(query, store.get(e.0 .1)), e.0 .1)))
-        .collect();
-    full_results.sort();
-    full_results.truncate(num_candidates);
-    full_results
-}
-
-fn search_queries(
-    query_store: &impl VectorStore<Vector = [f32]>,
-    num_candidates: NonZeroUsize,
-    limit: usize,
-    vector_store: &impl VectorStore<Vector = [f32]>,
-    bin_vector_store: Option<&impl VectorStore<Vector = [u8]>>,
-    oversample: f32,
-) {
-    match bin_vector_store {
-        Some(bin_store) => {
-            for q in query_store.iter().take(limit) {
-                assert_ne!(
-                    binary_retrieve(q, vector_store, bin_store, num_candidates.get(), oversample)
-                        .len(),
-                    0
-                );
-            }
-        }
-        None => {
-            for q in query_store.iter().take(limit) {
-                assert_ne!(
-                    full_retrieve(q, vector_store, num_candidates.get(),).len(),
-                    0
-                );
-            }
-        }
-    }
 }
 
 #[derive(Args)]
@@ -403,10 +245,7 @@ where
             .map(|(i, n)| {
                 (
                     i,
-                    Neighbor {
-                        id: n.id,
-                        score: query_scorer.score(self.store.get(n.id as usize)),
-                    },
+                    Neighbor::new(n.id, query_scorer.score(self.store.get(n.id as usize))),
                 )
             })
             .collect::<Vec<_>>();
@@ -575,7 +414,6 @@ fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
         Commands::Quantize(args) => quantize(args),
-        Commands::Search(args) => search(args),
         Commands::VamanaBuild(args) => vamana_build(args),
         Commands::VamanaSearch(args) => vamana_search(args),
     }

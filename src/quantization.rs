@@ -332,13 +332,6 @@ impl Quantizer {
         Self { state }
     }
 
-    /// Return a new stateless binary quantizer.
-    pub fn new_binary_quantizer() -> Self {
-        Self {
-            state: QuantizerState::Binary,
-        }
-    }
-
     /// Create a quantizer from state held in the footer of a file.
     ///
     /// Returns the quantizer and number of bytes consumed from the end of the store, or an error
