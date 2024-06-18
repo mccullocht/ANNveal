@@ -1,6 +1,8 @@
 use ordered_float::NotNan;
 use simsimd::{BinarySimilarity, SpatialSimilarity};
 
+use crate::quantization::Quantizer;
+
 /// Trait for scoring vectors against one another.
 pub trait VectorScorer {
     /// Type for the underlying vector data.
@@ -121,57 +123,24 @@ where
     }
 }
 
-/// Scores an f32 query vector against bit vectors.
-/// Remaps bit vectors into f32 space and scores for higher fidelity output.
-// XXX generalize this
-pub struct F32xBitEuclideanQueryScorer<'a> {
-    query: &'a [f32],
+pub struct EuclideanDequantizeScorer<'a, 'b> {
+    quantizer: &'a Quantizer,
+    query: &'b [f32],
 }
 
-impl<'a> F32xBitEuclideanQueryScorer<'a> {
-    pub fn new(query: &'a [f32]) -> Self {
-        Self { query }
+impl<'a, 'b> EuclideanDequantizeScorer<'a, 'b> {
+    pub fn new(quantizer: &'a Quantizer, query: &'b [f32]) -> Self {
+        Self { quantizer, query }
     }
 }
 
-const DECODE_4_BITS: [[f32; 4]; 16] = [
-    [-1.0, -1.0, -1.0, -1.0],
-    [1.0, -1.0, -1.0, -1.0],
-    [-1.0, 1.0, -1.0, -1.0],
-    [1.0, 1.0, -1.0, -1.0],
-    [-1.0, -1.0, 1.0, -1.0],
-    [1.0, -1.0, 1.0, -1.0],
-    [-1.0, 1.0, 1.0, -1.0],
-    [1.0, 1.0, 1.0, -1.0],
-    [-1.0, -1.0, -1.0, 1.0],
-    [1.0, -1.0, -1.0, 1.0],
-    [-1.0, 1.0, -1.0, 1.0],
-    [1.0, 1.0, -1.0, 1.0],
-    [-1.0, -1.0, 1.0, 1.0],
-    [1.0, -1.0, 1.0, 1.0],
-    [-1.0, 1.0, 1.0, 1.0],
-    [1.0, 1.0, 1.0, 1.0],
-];
-
-impl<'a> QueryScorer for F32xBitEuclideanQueryScorer<'a> {
+impl<'a, 'b> QueryScorer for EuclideanDequantizeScorer<'a, 'b> {
     type Vector = [u8];
 
     fn score(&self, a: &Self::Vector) -> NotNan<f32> {
-        // TODO: consider using slice.array_chunks()
-        // TODO: simsimd may not be buying me all that much.
-        let dist: f32 = self
-            .query
-            .chunks(8)
-            .zip(a)
-            .map(|(f, b)| {
-                let mut db = [0f32; 8];
-                db[0..4].copy_from_slice(&DECODE_4_BITS[*b as usize & 0xf]);
-                db[4..8].copy_from_slice(&DECODE_4_BITS[*b as usize >> 4]);
-                SpatialSimilarity::l2sq(f, &db).unwrap() as f32
-            })
-            .sum();
-        NotNan::new(1.0 / (1.0 + dist)).unwrap()
+        // XXX this is deeply inefficient. we could probably dequantize chunks to avoid allcoation?
+        let mut doc = vec![0.0f32; self.query.len()];
+        self.quantizer.dequantize_to(a, &mut doc);
+        EuclideanScorer.score(self.query, &doc)
     }
 }
-
-// XXX F32xInt2EuclideanQueryScorer
