@@ -344,6 +344,36 @@ impl ScalarQuantizerState {
         }
     }
 
+    fn dequantize_to(&self, vector: &[u8], out: &mut [f32]) {
+        let dequantize_one = |v: u8| -> f32 { (self.alpha * v as f32) + self.min_quantile as f32 };
+        match self.bits.next_power_of_two() {
+            2 => {
+                for (i, o) in vector
+                    .iter()
+                    .flat_map(|v| [v & 0x3, (v >> 2) & 0x3, (v >> 4) & 0x3, v >> 6])
+                    .zip(out.iter_mut())
+                {
+                    *o = dequantize_one(i)
+                }
+            }
+            4 => {
+                for (i, o) in vector
+                    .iter()
+                    .flat_map(|v| [v & 0xf, v >> 4])
+                    .zip(out.iter_mut())
+                {
+                    *o = dequantize_one(i)
+                }
+            }
+            8 => {
+                for (i, o) in vector.iter().zip(out.iter_mut()) {
+                    *o = dequantize_one(*i)
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn score_adjustment_multiplier(&self) -> f32 {
         self.alpha * self.alpha
     }
@@ -494,7 +524,7 @@ impl Quantizer {
                 }
             }
             QuantizerState::StatisticalBinary(state) => state.dequantize_to(vector, out),
-            QuantizerState::Scalar(_state) => todo!(),
+            QuantizerState::Scalar(state) => state.dequantize_to(vector, out),
         }
     }
 

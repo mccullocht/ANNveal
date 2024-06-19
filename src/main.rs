@@ -20,10 +20,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
-use scorer::{EuclideanDequantizeScorer, EuclideanScorer, QueryScorer};
+use scorer::{
+    DefaultQueryScorer, EuclideanDequantizeScorer, EuclideanScorer, QuantizedEuclideanQueryScorer,
+    QuantizedEuclideanScorer, QueryScorer,
+};
 use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStore, VectorStore};
-
-use crate::scorer::{DefaultQueryScorer, HammingScorer};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -154,7 +155,7 @@ fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
         args.beam_width,
         *args.alpha,
         &store,
-        HammingScorer,
+        QuantizedEuclideanScorer::new(store.quantizer()),
     );
     let mut progress = progress_bar(store.len(), "build ");
     builder.add_nodes_with_progress(0..store.len(), || progress.inc(1));
@@ -344,10 +345,8 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let quantizer = qvectors.quantizer();
     let mut recall_stats: Option<(usize, usize)> = None;
     for (i, query) in queries.iter().enumerate().take(limit) {
-        // XXX scorer selection is a mess.
-        let bin_query: Vec<u8> = quantizer.quantize(query);
-        let bin_query_scorer = DefaultQueryScorer::new(bin_query.as_ref(), &HammingScorer);
-        let mut results = searcher.search(&graph, &qvectors, &bin_query_scorer);
+        let quantized_query_scorer = QuantizedEuclideanQueryScorer::new(quantizer, query);
+        let mut results = searcher.search(&graph, &qvectors, &quantized_query_scorer);
         assert_ne!(results.len(), 0);
 
         if let Some(rr) = bit_reranker.as_mut() {
