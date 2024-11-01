@@ -5,7 +5,7 @@ use std::{
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
-    ops::Range,
+    ops::{Deref, Range},
     sync::{
         atomic::{AtomicU64, Ordering},
         RwLock, RwLockReadGuard,
@@ -588,21 +588,28 @@ impl Graph for MutableGraph {
 }
 
 /// In immutable graph implementation that can be loaded from a byte slice.
-// XXX would rather accept AsRef<[u8]> but there are self-referential struct problems there.
-pub struct ImmutableMemoryGraph<'a> {
+pub struct ImmutableMemoryGraph<D> {
+    // doing weird stuff with static slices to allow self referencing in an unprincipled way.
+    #[allow(dead_code)]
+    data: D,
     entry_point: Option<u32>,
-    node_extents: &'a [u64],
-    edges: &'a [u32],
+    node_extents: &'static [u64],
+    edges: &'static [u32],
 }
 
-impl<'a> ImmutableMemoryGraph<'a> {
-    pub fn new(rep: &'a [u8]) -> Result<Self, &'static str> {
+impl<D> ImmutableMemoryGraph<D> {
+    pub fn new(data: D) -> Result<Self, &'static str>
+    where
+        D: Deref<Target = [u8]>,
+    {
+        let rep: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
         if rep.len() < 8 {
             return Err("rep too short to contain a valid graph");
         }
-        let (num_nodes, rep) = Self::decode_u32(rep);
+        let (num_nodes, rep) = Self::decode_u32(&rep);
         if num_nodes == 0 {
             return Ok(Self {
+                data,
                 entry_point: None,
                 node_extents: &[],
                 edges: &[],
@@ -631,6 +638,7 @@ impl<'a> ImmutableMemoryGraph<'a> {
             return Err("rep does not align to u32 for edges");
         }
         Ok(Self {
+            data,
             entry_point: Some(entry_point),
             node_extents,
             edges,
@@ -648,7 +656,7 @@ pub struct ImmutableEdgeIterator<'a> {
 }
 
 impl<'a, 'b> ImmutableEdgeIterator<'a> {
-    fn new(graph: &'b ImmutableMemoryGraph<'a>, node: usize) -> Self {
+    fn new<D>(graph: &'b ImmutableMemoryGraph<D>, node: usize) -> Self {
         let begin = graph.node_extents[node] as usize;
         let end = graph.node_extents[node + 1] as usize;
         Self {
@@ -673,7 +681,7 @@ impl<'a> ExactSizeIterator for ImmutableEdgeIterator<'a> {}
 
 impl<'a> FusedIterator for ImmutableEdgeIterator<'a> {}
 
-impl<'a> Graph for ImmutableMemoryGraph<'a> {
+impl<D> Graph for ImmutableMemoryGraph<D> {
     type NeighborEdgeIterator<'c> = ImmutableEdgeIterator<'c> where Self: 'c;
 
     fn entry_point(&self) -> Option<usize> {
@@ -864,7 +872,7 @@ mod test {
         let mutable_graph: MutableGraph = build_graph(&store);
         let mut serialized_graph = Vec::new();
         mutable_graph.write(&mut serialized_graph).unwrap();
-        let immutable_graph = ImmutableMemoryGraph::new(&serialized_graph).unwrap();
+        let immutable_graph = ImmutableMemoryGraph::new(serialized_graph).unwrap();
 
         assert_eq!(get_neighbors(&immutable_graph, 0), vec![1, 2, 4, 8]);
         assert_eq!(get_neighbors(&immutable_graph, 7), vec![3, 5, 6, 15]);

@@ -8,7 +8,8 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     num::NonZeroUsize,
-    path::PathBuf,
+    ops::Range,
+    path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -128,6 +129,9 @@ struct VamanaBuildArgs {
     /// Alpha value for pruning; must be >= 1.0
     #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
     alpha: NotNan<f32>,
+    /// Number of graph shards.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(1).unwrap())]
+    shards: NonZeroUsize,
 }
 
 fn progress_bar(len: usize, message: &'static str) -> ProgressBar {
@@ -144,29 +148,66 @@ fn progress_bar(len: usize, message: &'static str) -> ProgressBar {
     progress
 }
 
+fn shard_id_range(len: usize, shards: NonZeroUsize) -> Vec<Range<usize>> {
+    (0..shards.get())
+        .map(|s| {
+            let start = len / shards.get() * s;
+            let end = if s + 1 == shards.get() {
+                len
+            } else {
+                len / shards.get() * (s + 1)
+            };
+            start..end
+        })
+        .collect()
+}
+
+fn shard_path(path: &Path, shard: usize, shards: NonZeroUsize) -> PathBuf {
+    let mut shard_path = path.to_owned();
+    if shards.get() != 1 {
+        shard_path.set_file_name(format!(
+            "{}-{:05}-of-{:05}",
+            shard_path.file_name().unwrap_or_default().to_string_lossy(),
+            shard,
+            shards.get()
+        ));
+    }
+    shard_path
+}
+
 fn vamana_build(args: VamanaBuildArgs) -> std::io::Result<()> {
     let store = SliceQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
         args.dimensions,
     );
-    // TODO: allow building a vamana graph from a float vector store.
-    let builder = GraphBuilder::new(
-        args.max_degree,
-        args.beam_width,
-        *args.alpha,
-        &store,
-        QuantizedEuclideanScorer::new(store.quantizer()),
-    );
-    let mut progress = progress_bar(store.len(), "build ");
-    builder.add_nodes_with_progress(0..store.len(), || progress.inc(1));
-    progress.finish_using_style();
 
-    progress = progress_bar(store.len(), "finish");
-    let graph = builder.finish_with_progress(|| progress.inc(1));
-    progress.finish_using_style();
+    for (shard, range) in shard_id_range(store.len(), args.shards)
+        .into_iter()
+        .enumerate()
+    {
+        // TODO: allow building a vamana graph from a float vector store.
+        let builder = GraphBuilder::new(
+            args.max_degree,
+            args.beam_width,
+            *args.alpha,
+            &store,
+            QuantizedEuclideanScorer::new(store.quantizer()),
+        );
+        let mut progress = progress_bar(range.len(), "build ");
+        builder.add_nodes_with_progress(range.clone(), || progress.inc(1));
+        progress.finish_using_style();
 
-    let mut w = BufWriter::new(File::create(args.index_file)?);
-    graph.write(&mut w)?;
+        progress = progress_bar(store.len(), "finish");
+        let graph = builder.finish_with_progress(|| progress.inc(1));
+        progress.finish_using_style();
+
+        let mut w = BufWriter::new(File::create(shard_path(
+            &args.index_file,
+            shard,
+            args.shards,
+        ))?);
+        graph.write(&mut w)?;
+    }
     Ok(())
 }
 
@@ -206,6 +247,9 @@ struct VamanaSearchArgs {
     /// Number of vectors to rerank with f32 when --f32-vectors is set.
     #[arg(long)]
     f32_rerank_budget: Option<usize>,
+    /// Number of graph shards.
+    #[arg(short, long, default_value_t = NonZeroUsize::new(1).unwrap())]
+    shards: NonZeroUsize,
 }
 
 struct Reranker<'a, B> {
@@ -285,8 +329,15 @@ struct RecallState {
 }
 
 fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
-    let graph_backing = unsafe { memmap2::Mmap::map(&File::open(args.graph)?)? };
-    let graph = ImmutableMemoryGraph::new(&graph_backing).unwrap();
+    let mut graphs = Vec::with_capacity(args.shards.get());
+    for shard in 0..args.shards.get() {
+        graphs.push(
+            ImmutableMemoryGraph::new(unsafe {
+                memmap2::Mmap::map(&File::open(shard_path(&args.graph, shard, args.shards))?)?
+            })
+            .unwrap(),
+        );
+    }
     let qvectors = SliceQuantizedVectorStore::new(
         unsafe { memmap2::Mmap::map(&File::open(args.bin_vectors)?)? },
         args.dimensions,
@@ -346,8 +397,23 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     let mut recall_stats: Option<(usize, usize)> = None;
     for (i, query) in queries.iter().enumerate().take(limit) {
         let quantized_query_scorer = QuantizedEuclideanQueryScorer::new(quantizer, query);
-        let mut results = searcher.search(&graph, &qvectors, &quantized_query_scorer);
+        let mut results = searcher.search(&graphs[0], &qvectors, &quantized_query_scorer);
+        for graph in graphs.iter().skip(1) {
+            searcher.clear();
+            let sub_results = searcher.search(graph, &qvectors, &quantized_query_scorer);
+            for result in sub_results {
+                if let Some(worst) = results.0.last() {
+                    if result < *worst {
+                        results.0.truncate(args.num_candidates.get() - 1);
+                        results.insert(result);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
         assert_ne!(results.len(), 0);
+        assert!(results.len() <= args.num_candidates.get());
 
         if let Some(rr) = bit_reranker.as_mut() {
             let query_scorer = EuclideanDequantizeScorer::new(qvectors.quantizer(), query);
