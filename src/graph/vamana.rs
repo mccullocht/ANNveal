@@ -5,7 +5,7 @@ use std::{
     io::Write,
     iter::FusedIterator,
     num::NonZeroUsize,
-    ops::{Deref, Range},
+    ops::{AddAssign, Deref, Range},
     sync::{
         atomic::{AtomicU64, Ordering},
         RwLock, RwLockReadGuard,
@@ -113,10 +113,32 @@ impl From<NeighborResultSet> for Vec<Neighbor> {
     }
 }
 
+#[derive(Default, Debug)]
+pub struct GraphSearchStats {
+    /// Number of nodes seen and scored for navigation.
+    pub seen: usize,
+    /// Number of nodes visited as part of result set calculation.
+    pub visited: usize,
+}
+
+impl AddAssign for GraphSearchStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.seen += rhs.seen;
+        self.visited += rhs.visited;
+    }
+}
+
+impl std::fmt::Display for GraphSearchStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "seen {} visited {}", self.seen, self.visited)
+    }
+}
+
 #[derive(Debug)]
 pub struct GraphSearcher {
     results: NeighborResultSet,
     seen: AHashSet<usize>,
+    visited: usize,
 }
 
 impl GraphSearcher {
@@ -125,6 +147,7 @@ impl GraphSearcher {
         Self {
             results: NeighborResultSet::new(k.into()),
             seen: AHashSet::new(),
+            visited: 0,
         }
     }
 
@@ -155,6 +178,7 @@ impl GraphSearcher {
         self.results.add((entry_point as u32, score).into());
 
         while let Some(candidate) = self.results.best_unvisited() {
+            self.visited += 1;
             for neighbor_id in graph.neighbors_iter(candidate.id as usize) {
                 // skip candidates we've already visited.
                 if !self.seen.insert(neighbor_id) {
@@ -167,9 +191,17 @@ impl GraphSearcher {
         }
     }
 
+    pub fn stats(&self) -> GraphSearchStats {
+        GraphSearchStats {
+            seen: self.seen.len(),
+            visited: self.visited,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.results.clear();
         self.seen.clear();
+        self.visited = 0;
     }
 }
 

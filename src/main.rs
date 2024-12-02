@@ -14,7 +14,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use graph::{
-    vamana::{GraphBuilder, GraphSearcher, ImmutableMemoryGraph},
+    vamana::{GraphBuilder, GraphSearchStats, GraphSearcher, ImmutableMemoryGraph},
     Neighbor, NeighborSet,
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -360,6 +360,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         queries.len(),
     );
 
+    let mut stats = GraphSearchStats::default();
     let recall_state = if let Some((p, k)) = args.neighbors.zip(args.recall_k) {
         Some(RecallState {
             neighbors: SliceU32VectorStore::new(
@@ -398,9 +399,11 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     for (i, query) in queries.iter().enumerate().take(limit) {
         let quantized_query_scorer = QuantizedEuclideanQueryScorer::new(quantizer, query);
         let mut results = searcher.search(&graphs[0], &qvectors, &quantized_query_scorer);
+        stats += searcher.stats();
         for graph in graphs.iter().skip(1) {
             searcher.clear();
             let sub_results = searcher.search(graph, &qvectors, &quantized_query_scorer);
+            stats += searcher.stats();
             for result in sub_results {
                 if let Some(worst) = results.0.last() {
                     if result < *worst {
@@ -449,9 +452,10 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
 
     progress.finish_using_style();
     println!(
-        "queries {} avg duration {:.3} ms",
+        "queries {} avg duration {:.3} ms  search stats {}",
         limit,
-        progress.elapsed().div_f32(limit as f32).as_micros() as f64 / 1_000f64
+        progress.elapsed().div_f32(limit as f32).as_micros() as f64 / 1_000f64,
+        stats
     );
     if let Some(rr) = bit_reranker.as_ref() {
         println!(
