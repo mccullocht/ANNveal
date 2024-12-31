@@ -22,6 +22,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
+use scann::{KMeansParams, KMeansTreeNode, KMeansTreeParams, SubsetVectorStore};
 use scorer::{
     DefaultQueryScorer, EuclideanDequantizeScorer, EuclideanScorer, QuantizedEuclideanQueryScorer,
     QuantizedEuclideanScorer, QueryScorer,
@@ -29,6 +30,7 @@ use scorer::{
 use store::{
     new_mmap_vector_store, SliceQuantizedVectorStore, StableDerefVectorStore, VectorStore,
 };
+use utils::well_sample;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -45,6 +47,8 @@ enum Commands {
     VamanaBuild(VamanaBuildArgs),
     /// Search a Vamana vector index stored on disk.
     VamanaSearch(VamanaSearchArgs),
+    /// Build a KMeans tree from the input and store it on disk.
+    KMeansTreeBuild(KMeansTreeBuildArgs),
 }
 
 #[derive(Args)]
@@ -466,11 +470,54 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Args)]
+struct KMeansTreeBuildArgs {
+    /// Path to the input vectors.
+    #[arg(short, long)]
+    vectors: PathBuf,
+    /// Number of dimensions in input vectors.
+    #[arg(short, long)]
+    dimensions: NonZero<usize>,
+
+    /// Number of samples to take from the input vectors.
+    #[arg(long)]
+    sample_size: NonZero<usize>,
+    /// Number of centers per tree node.
+    #[arg(short, long)]
+    num_children: NonZero<usize>,
+
+    /// Path to the output KMeansTree file.
+    #[arg(long)]
+    kmeans_tree: PathBuf,
+}
+
+fn kmeans_tree_build(args: KMeansTreeBuildArgs) -> std::io::Result<()> {
+    let float_vector_store = SliceFloatVectorStore::new(
+        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
+        args.dimensions,
+    );
+
+    let kmeans_sample_vector_store = SubsetVectorStore::new(
+        &float_vector_store,
+        well_sample(float_vector_store.len(), args.sample_size.get()),
+    );
+    let mut next_leaf_id = 0usize;
+    let _root = KMeansTreeNode::train(
+        &kmeans_sample_vector_store,
+        args.num_children,
+        &KMeansTreeParams::default(),
+        &KMeansParams::default(),
+        &mut next_leaf_id,
+    );
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     let args = Cli::parse();
     match args.command {
         Commands::Quantize(args) => quantize(args),
         Commands::VamanaBuild(args) => vamana_build(args),
         Commands::VamanaSearch(args) => vamana_search(args),
+        Commands::KMeansTreeBuild(args) => kmeans_tree_build(args),
     }
 }

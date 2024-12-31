@@ -4,10 +4,8 @@ use std::{
 };
 
 use ordered_float::OrderedFloat;
-use rand::Rng;
-use rand_pcg::Pcg64Mcg;
 
-use crate::store::VectorStore;
+use crate::{store::VectorStore, utils::well_sample};
 
 // TODO: move into a quantization module. sbq and scalar should have own files.
 
@@ -583,8 +581,6 @@ const BINARY_DEQUANTIZE_4_BITS: [[f32; 4]; 16] = [
     [1.0, 1.0, 1.0, 1.0],
 ];
 
-const RANDOM_SEED: u128 = 0xbeab3d60061ed00d;
-
 // TODO: move this into store module and make it public.
 pub(crate) struct SampleIterator<'a, S> {
     store: &'a S,
@@ -596,24 +592,8 @@ impl<'a, S> SampleIterator<'a, S> {
     where
         S: VectorStore<Vector = [f32]>,
     {
-        if store.len() < max_sample_size {
-            let samples = (0..store.len()).collect::<Vec<_>>().into_iter();
-            Self { store, samples }
-        } else {
-            let mut reservoirs = (0..max_sample_size).collect::<Vec<_>>();
-            let mut rng = Pcg64Mcg::new(RANDOM_SEED);
-            for i in reservoirs.len()..store.len() {
-                let j = rng.gen_range(0..(i + 1));
-                if j < reservoirs.len() {
-                    reservoirs[j] = i;
-                }
-            }
-            reservoirs.sort();
-            Self {
-                store,
-                samples: reservoirs.into_iter(),
-            }
-        }
+        let samples = well_sample(store.len(), max_sample_size).into_iter();
+        Self { store, samples }
     }
 }
 

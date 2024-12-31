@@ -1,3 +1,5 @@
+use rand::{Rng, SeedableRng};
+use rand_pcg::Pcg64Mcg;
 use smallvec::{smallvec, SmallVec};
 
 /// Tracks a set of `usize` up to a fixed value.
@@ -64,5 +66,25 @@ impl Iterator for WordSetIter {
         } else {
             None
         }
+    }
+}
+
+const RANDOM_SEED: u64 = 0xbeab3d60061ed00d;
+
+/// Yield a well sample of up to `max_sample_len` items from a dataset of size `dataset_len`.
+pub fn well_sample(dataset_len: usize, max_sample_len: usize) -> Vec<usize> {
+    if dataset_len < max_sample_len {
+        (0..dataset_len).collect()
+    } else {
+        let mut reservoirs = (0..max_sample_len).collect::<Vec<_>>();
+        let mut rng = Pcg64Mcg::seed_from_u64(RANDOM_SEED);
+        for i in reservoirs.len()..dataset_len {
+            let j = rng.gen_range(0..(i + 1));
+            if j < reservoirs.len() {
+                reservoirs[j] = i;
+            }
+        }
+        reservoirs.sort();
+        reservoirs
     }
 }
