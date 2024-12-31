@@ -586,13 +586,13 @@ const BINARY_DEQUANTIZE_4_BITS: [[f32; 4]; 16] = [
 const RANDOM_SEED: u128 = 0xbeab3d60061ed00d;
 
 // TODO: move this into store module and make it public.
-struct SampleIterator<'a, S> {
+pub(crate) struct SampleIterator<'a, S> {
     store: &'a S,
     samples: std::vec::IntoIter<usize>,
 }
 
 impl<'a, S> SampleIterator<'a, S> {
-    fn new(store: &'a S, max_sample_size: usize) -> Self
+    pub(crate) fn new(store: &'a S, max_sample_size: usize) -> Self
     where
         S: VectorStore<Vector = [f32]>,
     {

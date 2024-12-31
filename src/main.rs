@@ -1,5 +1,6 @@
 mod graph;
 mod quantization;
+pub mod scann; // XXX
 mod scorer;
 mod store;
 mod utils;
