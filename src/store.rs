@@ -13,7 +13,7 @@ use stable_deref_trait::StableDeref;
 use crate::quantization::{QuantizationAlgorithm, Quantizer};
 
 /// Dense store of vector data, analogous to a `Vec``.
-pub trait VectorStore: Index<usize, Output = Self::Vector> {
+pub trait VectorStore: Index<usize, Output = Self::Vector> + Send + Sync {
     /// Type of the underlying vector data.
     type Vector: ?Sized;
 
@@ -22,6 +22,16 @@ pub trait VectorStore: Index<usize, Output = Self::Vector> {
 
     /// Return an iterator over the vectors in this store.
     fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector>;
+
+    /// Obtain a view of a subset of the vectors in the store.
+    ///
+    /// This subset will be presented as a densely indexed (so 0..len()).
+    fn subset_view(&self, subset: Vec<usize>) -> impl VectorStore<Vector = Self::Vector>
+    where
+        Self: Sized,
+    {
+        SubsetViewVectorStore::new(self, subset)
+    }
 }
 
 /// Trait for vector stores that can compute a mean vector.
@@ -63,7 +73,9 @@ impl<E: 'static, D: StableDeref<Target = [u8]>> StableDerefVectorStore<E, D> {
     }
 }
 
-impl<E: 'static, D: StableDeref<Target = [u8]>> VectorStore for StableDerefVectorStore<E, D> {
+impl<E: 'static + Send + Sync, D: StableDeref<Target = [u8]> + Send + Sync> VectorStore
+    for StableDerefVectorStore<E, D>
+{
     type Vector = [E];
 
     fn len(&self) -> usize {
@@ -106,7 +118,7 @@ pub struct SliceQuantizedVectorStore<S> {
 
 impl<S> SliceQuantizedVectorStore<S>
 where
-    S: Deref<Target = [u8]>,
+    S: Deref<Target = [u8]> + Send + Sync,
 {
     pub fn new(data: S, dimensions: NonZero<usize>) -> Self {
         let mut cursor = Cursor::new(&*data);
@@ -274,7 +286,7 @@ where
 
 impl<S> VectorStore for SliceQuantizedVectorStore<S>
 where
-    S: Deref<Target = [u8]>,
+    S: Deref<Target = [u8]> + Send + Sync,
 {
     type Vector = [u8];
 
@@ -297,7 +309,7 @@ impl<S: Deref<Target = [u8]>> Index<usize> for SliceQuantizedVectorStore<S> {
     }
 }
 
-impl<S: Deref<Target = [u8]>> MeanVectorStore for SliceQuantizedVectorStore<S> {
+impl<S: Deref<Target = [u8]> + Send + Sync> MeanVectorStore for SliceQuantizedVectorStore<S> {
     fn mean_vector(&self) -> <Self::Vector as ToOwned>::Owned
     where
         Self::Vector: ToOwned,
@@ -311,5 +323,47 @@ impl<S: Deref<Target = [u8]>> MeanVectorStore for SliceQuantizedVectorStore<S> {
             }
             QuantizationAlgorithm::Scalar(bits) => self.mean_scalar_vector(bits),
         }
+    }
+}
+
+/// Present a listed subset of vectors in an underlying store.
+pub struct SubsetViewVectorStore<'a, V> {
+    parent: &'a V,
+    subset: Vec<usize>,
+}
+
+impl<'a, V> SubsetViewVectorStore<'a, V> {
+    pub fn new(parent: &'a V, subset: Vec<usize>) -> Self {
+        Self { parent, subset }
+    }
+}
+
+impl<'a, V: VectorStore> VectorStore for SubsetViewVectorStore<'a, V> {
+    type Vector = V::Vector;
+
+    fn len(&self) -> usize {
+        self.subset.len()
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
+        self.subset.iter().map(|i| &self.parent[*i])
+    }
+
+    fn subset_view(&self, mut subset: Vec<usize>) -> impl VectorStore<Vector = Self::Vector>
+    where
+        Self: Sized,
+    {
+        for i in subset.iter_mut() {
+            *i = self.subset[*i];
+        }
+        SubsetViewVectorStore::new(self.parent, subset)
+    }
+}
+
+impl<V: VectorStore> Index<usize> for SubsetViewVectorStore<'_, V> {
+    type Output = V::Vector;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.parent[self.subset[index]]
     }
 }

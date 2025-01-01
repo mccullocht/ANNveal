@@ -53,12 +53,8 @@ impl KMeansTreeNode {
         let children = subpartitions
             .into_iter()
             .map(|p| {
-                let child_training_data = SubsetVectorStore {
-                    parent: training_data,
-                    subset: p,
-                };
                 KMeansTreeNode::train(
-                    &child_training_data,
+                    &training_data.subset_view(p),
                     k_per_node,
                     tree_params,
                     kmeans_params,
@@ -243,37 +239,5 @@ impl IndexMut<usize> for MutableFloatVectorStore {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         let r = self.range(index);
         &mut self.data[r]
-    }
-}
-
-/// Present a listed subset of vectors in an underlying store.
-pub struct SubsetVectorStore<'a, V: Send + Sync> {
-    parent: &'a V,
-    subset: Vec<usize>,
-}
-
-impl<'a, V: Send + Sync> SubsetVectorStore<'a, V> {
-    pub fn new(parent: &'a V, subset: Vec<usize>) -> Self {
-        Self { parent, subset }
-    }
-}
-
-impl<'a, V: VectorStore + Send + Sync> VectorStore for SubsetVectorStore<'a, V> {
-    type Vector = V::Vector;
-
-    fn len(&self) -> usize {
-        self.subset.len()
-    }
-
-    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
-        self.subset.iter().map(|i| &self.parent[*i])
-    }
-}
-
-impl<V: VectorStore + Send + Sync> Index<usize> for SubsetVectorStore<'_, V> {
-    type Output = V::Vector;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.parent[self.subset[index]]
     }
 }

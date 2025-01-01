@@ -22,13 +22,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ordered_float::NotNan;
 use quantization::{QuantizationAlgorithm, Quantizer};
 use rayon::prelude::*;
-use scann::{KMeansParams, KMeansTreeNode, KMeansTreeParams, SubsetVectorStore};
+use scann::{KMeansParams, KMeansTreeNode, KMeansTreeParams};
 use scorer::{
     DefaultQueryScorer, EuclideanDequantizeScorer, EuclideanScorer, QuantizedEuclideanQueryScorer,
     QuantizedEuclideanScorer, QueryScorer,
 };
 use store::{
-    new_mmap_vector_store, SliceQuantizedVectorStore, StableDerefVectorStore, VectorStore,
+    new_mmap_vector_store, SliceQuantizedVectorStore, StableDerefVectorStore,
+    SubsetViewVectorStore, VectorStore,
 };
 use utils::well_sample;
 
@@ -493,7 +494,7 @@ struct KMeansTreeBuildArgs {
 
 fn kmeans_tree_build(args: KMeansTreeBuildArgs) -> std::io::Result<()> {
     let float_vector_store = new_mmap_vector_store(&args.vectors, args.dimensions.get())?;
-    let kmeans_sample_vector_store = SubsetVectorStore::new(
+    let kmeans_sample_vector_store = SubsetViewVectorStore::new(
         &float_vector_store,
         well_sample(float_vector_store.len(), args.sample_size.get()),
     );
