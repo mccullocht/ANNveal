@@ -492,11 +492,7 @@ struct KMeansTreeBuildArgs {
 }
 
 fn kmeans_tree_build(args: KMeansTreeBuildArgs) -> std::io::Result<()> {
-    let float_vector_store = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
-        args.dimensions,
-    );
-
+    let float_vector_store = new_mmap_vector_store(&args.vectors, args.dimensions.get())?;
     let kmeans_sample_vector_store = SubsetVectorStore::new(
         &float_vector_store,
         well_sample(float_vector_store.len(), args.sample_size.get()),

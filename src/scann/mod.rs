@@ -1,4 +1,7 @@
-use std::{num::NonZero, ops::Range};
+use std::{
+    num::NonZero,
+    ops::{Index, IndexMut, Range},
+};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -98,7 +101,7 @@ pub fn kmeans<V: VectorStore<Vector = [f32]> + Send + Sync>(
     clusters: NonZero<usize>,
     params: &KMeansParams,
 ) -> (MutableFloatVectorStore, Vec<Vec<usize>>) {
-    let dim = training_data.get(0).len();
+    let dim = training_data[0].len();
     let mut centroids = MutableFloatVectorStore::new(clusters.get(), dim);
     for (i, s) in SampleIterator::new(training_data, clusters.get()).enumerate() {
         centroids.get_mut(i).copy_from_slice(s);
@@ -111,7 +114,7 @@ pub fn kmeans<V: VectorStore<Vector = [f32]> + Send + Sync>(
         assignments = (0..training_data.len())
             .into_par_iter()
             .map(|i| {
-                let v = training_data.get(i);
+                let v = &training_data[i];
                 centroids
                     .iter()
                     .enumerate()
@@ -147,9 +150,9 @@ pub fn kmeans<V: VectorStore<Vector = [f32]> + Send + Sync>(
 
         // Recompute centroids. Start by summing input vectors for each cluster and dividing by count.
         centroids.fill(0.0);
-        for (cluster, _) in assignments.iter() {
+        for (i, (cluster, _)) in assignments.iter().enumerate() {
             let centroid = centroids.get_mut(*cluster);
-            for (c, v) in centroid.iter_mut().zip(training_data.get(*cluster)) {
+            for (c, v) in centroid.iter_mut().zip(&training_data[i]) {
                 *c += v;
             }
         }
@@ -161,7 +164,7 @@ pub fn kmeans<V: VectorStore<Vector = [f32]> + Send + Sync>(
 
     let mut partitions = cluster_sizes
         .into_iter()
-        .map(|l| Vec::with_capacity(l))
+        .map(Vec::with_capacity)
         .collect::<Vec<_>>();
     for (i, (c, _)) in assignments.into_iter().enumerate() {
         partitions[c].push(i);
@@ -186,7 +189,7 @@ impl MutableFloatVectorStore {
 
     fn from_store<V: VectorStore<Vector = [f32]>>(store: &V) -> Self {
         if store.len() > 0 {
-            let mut s = MutableFloatVectorStore::new(store.len(), store.get(0).len());
+            let mut s = MutableFloatVectorStore::new(store.len(), store[0].len());
             for (i, o) in store.iter().zip(s.iter_mut()) {
                 o.copy_from_slice(i);
             }
@@ -209,8 +212,8 @@ impl MutableFloatVectorStore {
         self.data.chunks_mut(self.dim)
     }
 
-    fn range(&self, i: usize) -> Range<usize> {
-        let start = i * self.dim;
+    fn range(&self, index: usize) -> Range<usize> {
+        let start = index * self.dim;
         let end = start + self.dim;
         start..end
     }
@@ -219,19 +222,27 @@ impl MutableFloatVectorStore {
 impl VectorStore for MutableFloatVectorStore {
     type Vector = [f32];
 
-    fn get(&self, i: usize) -> &Self::Vector {
-        &self.data[self.range(i)]
-    }
-
     fn len(&self) -> usize {
         self.data.len() / self.dim
     }
 
-    fn mean_vector(&self) -> <Self::Vector as ToOwned>::Owned
-    where
-        Self::Vector: ToOwned,
-    {
-        unimplemented!()
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
+        self.data.chunks(self.dim)
+    }
+}
+
+impl Index<usize> for MutableFloatVectorStore {
+    type Output = [f32];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.data[self.range(index)]
+    }
+}
+
+impl IndexMut<usize> for MutableFloatVectorStore {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let r = self.range(index);
+        &mut self.data[r]
     }
 }
 
@@ -250,18 +261,19 @@ impl<'a, V: Send + Sync> SubsetVectorStore<'a, V> {
 impl<'a, V: VectorStore + Send + Sync> VectorStore for SubsetVectorStore<'a, V> {
     type Vector = V::Vector;
 
-    fn get(&self, i: usize) -> &Self::Vector {
-        self.parent.get(self.subset[i])
-    }
-
     fn len(&self) -> usize {
         self.subset.len()
     }
 
-    fn mean_vector(&self) -> <Self::Vector as ToOwned>::Owned
-    where
-        Self::Vector: ToOwned,
-    {
-        unimplemented!()
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
+        self.subset.iter().map(|i| &self.parent[*i])
+    }
+}
+
+impl<V: VectorStore + Send + Sync> Index<usize> for SubsetVectorStore<'_, V> {
+    type Output = V::Vector;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.parent[self.subset[index]]
     }
 }
