@@ -112,18 +112,8 @@ impl QuantizedEuclideanScorerState {
         match self {
             Self::Binary => None,
             Self::Scalar(bits, _) => match bits {
-                2 => Some(
-                    packed
-                        .chunks(16)
-                        .flat_map(|p| Self::unpack2_quad(p))
-                        .collect(),
-                ),
-                4 => Some(
-                    packed
-                        .chunks(16)
-                        .flat_map(|p| Self::unpack4_quad(p))
-                        .collect(),
-                ),
+                2 => Some(packed.chunks(16).flat_map(Self::unpack2_quad).collect()),
+                4 => Some(packed.chunks(16).flat_map(Self::unpack4_quad).collect()),
                 _ => None,
             },
         }
@@ -245,7 +235,7 @@ where
     }
 }
 
-impl<'a, 'b, Q, S> QueryScorer for DefaultQueryScorer<'a, 'b, Q, S>
+impl<Q, S> QueryScorer for DefaultQueryScorer<'_, '_, Q, S>
 where
     Q: ?Sized,
     S: VectorScorer<Vector = Q>,
@@ -301,7 +291,7 @@ impl<'a, 'b> EuclideanDequantizeScorer<'a, 'b> {
     }
 }
 
-impl<'a, 'b> QueryScorer for EuclideanDequantizeScorer<'a, 'b> {
+impl QueryScorer for EuclideanDequantizeScorer<'_, '_> {
     type Vector = [u8];
 
     fn score(&self, a: &Self::Vector) -> NotNan<f32> {

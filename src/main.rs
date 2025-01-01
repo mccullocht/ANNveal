@@ -7,7 +7,7 @@ mod utils;
 use std::{
     fs::File,
     io::{BufWriter, Write},
-    num::NonZeroUsize,
+    num::NonZero,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -25,7 +25,9 @@ use scorer::{
     DefaultQueryScorer, EuclideanDequantizeScorer, EuclideanScorer, QuantizedEuclideanQueryScorer,
     QuantizedEuclideanScorer, QueryScorer,
 };
-use store::{SliceFloatVectorStore, SliceQuantizedVectorStore, SliceU32VectorStore, VectorStore};
+use store::{
+    new_mmap_vector_store, SliceQuantizedVectorStore, StableDerefVectorStore, VectorStore,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -54,7 +56,7 @@ struct QuantizeArgs {
     output: PathBuf,
     /// Number of dimensions in input vectors.
     #[arg(short, long)]
-    dimensions: NonZeroUsize,
+    dimensions: NonZero<usize>,
     /// Quantization algorithm to use.
     #[arg(short, long)]
     quantizer: QuantizerAlgorithm,
@@ -76,10 +78,7 @@ enum QuantizerAlgorithm {
 }
 
 fn quantize(args: QuantizeArgs) -> std::io::Result<()> {
-    let float_vector_store = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(args.vectors)?)? },
-        args.dimensions,
-    );
+    let float_vector_store = new_mmap_vector_store(&args.vectors, args.dimensions.get())?;
     let mut vectors_out = BufWriter::new(File::create(args.output)?);
     let progress = ProgressBar::new(float_vector_store.len() as u64)
         .with_style(
@@ -116,22 +115,22 @@ struct VamanaBuildArgs {
     vectors: PathBuf,
     /// Number of dimensions in input vectors.
     #[arg(short, long)]
-    dimensions: NonZeroUsize,
+    dimensions: NonZero<usize>,
     /// Path to output vamana index file.
     #[arg(short, long)]
     index_file: PathBuf,
     /// Maximum degree of each vertex in the vamana graph.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(32).unwrap())]
-    max_degree: NonZeroUsize,
+    #[arg(short, long, default_value_t = NonZero::new(32).unwrap())]
+    max_degree: NonZero<usize>,
     /// Beam width for search during index build.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(200).unwrap())]
-    beam_width: NonZeroUsize,
+    #[arg(short, long, default_value_t = NonZero::new(200).unwrap())]
+    beam_width: NonZero<usize>,
     /// Alpha value for pruning; must be >= 1.0
     #[arg(short, long, default_value_t = NotNan::new(1.2f32).unwrap())]
     alpha: NotNan<f32>,
     /// Number of graph shards.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(1).unwrap())]
-    shards: NonZeroUsize,
+    #[arg(short, long, default_value_t = NonZero::new(1).unwrap())]
+    shards: NonZero<usize>,
 }
 
 fn progress_bar(len: usize, message: &'static str) -> ProgressBar {
@@ -148,7 +147,7 @@ fn progress_bar(len: usize, message: &'static str) -> ProgressBar {
     progress
 }
 
-fn shard_id_range(len: usize, shards: NonZeroUsize) -> Vec<Range<usize>> {
+fn shard_id_range(len: usize, shards: NonZero<usize>) -> Vec<Range<usize>> {
     (0..shards.get())
         .map(|s| {
             let start = len / shards.get() * s;
@@ -162,7 +161,7 @@ fn shard_id_range(len: usize, shards: NonZeroUsize) -> Vec<Range<usize>> {
         .collect()
 }
 
-fn shard_path(path: &Path, shard: usize, shards: NonZeroUsize) -> PathBuf {
+fn shard_path(path: &Path, shard: usize, shards: NonZero<usize>) -> PathBuf {
     let mut shard_path = path.to_owned();
     if shards.get() != 1 {
         shard_path.set_file_name(format!(
@@ -224,23 +223,23 @@ struct VamanaSearchArgs {
     f32_vectors: Option<PathBuf>,
     /// Number of dimensions in input vectors.
     #[arg(short, long)]
-    dimensions: NonZeroUsize,
+    dimensions: NonZero<usize>,
     /// Beam width for search during index build.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(100).unwrap())]
-    num_candidates: NonZeroUsize,
+    #[arg(short, long, default_value_t = NonZero::new(100).unwrap())]
+    num_candidates: NonZero<usize>,
 
     /// Path to input query flat vector file.
     #[arg(short, long)]
     queries: PathBuf,
     /// Number of queries to run. If unset, run all input queries.
     #[arg(short, long)]
-    num_queries: Option<NonZeroUsize>,
+    num_queries: Option<NonZero<usize>>,
     /// List of 100 neighbors for each input query, as an array of `u32`s.
     #[arg(short, long)]
     neighbors: Option<PathBuf>,
     /// Compute recall in top K results. Requires that --neighbors is also set.
     #[arg(short, long)]
-    recall_k: Option<NonZeroUsize>,
+    recall_k: Option<NonZero<usize>>,
     /// Number of vectors to rerank using f32 x bit scoring.
     #[arg(long)]
     bit_rerank_budget: Option<usize>,
@@ -248,8 +247,8 @@ struct VamanaSearchArgs {
     #[arg(long)]
     f32_rerank_budget: Option<usize>,
     /// Number of graph shards.
-    #[arg(short, long, default_value_t = NonZeroUsize::new(1).unwrap())]
-    shards: NonZeroUsize,
+    #[arg(short, long, default_value_t = NonZero::new(1).unwrap())]
+    shards: NonZero<usize>,
 }
 
 struct Reranker<'a, B> {
@@ -290,7 +289,7 @@ where
             .map(|(i, n)| {
                 (
                     i,
-                    Neighbor::new(n.id, query_scorer.score(self.store.get(n.id as usize))),
+                    Neighbor::new(n.id, query_scorer.score(&self.store[n.id as usize])),
                 )
             })
             .collect::<Vec<_>>();
@@ -324,7 +323,7 @@ where
 }
 
 struct RecallState {
-    neighbors: SliceU32VectorStore<memmap2::Mmap>,
+    neighbors: StableDerefVectorStore<u32, memmap2::Mmap>,
     k: usize,
 }
 
@@ -343,30 +342,19 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
         args.dimensions,
     );
     let f32_vectors = match args.f32_vectors {
-        Some(vectors) => Some(SliceFloatVectorStore::new(
-            unsafe { memmap2::Mmap::map(&File::open(vectors)?)? },
-            args.dimensions,
-        )),
+        Some(vectors) => Some(new_mmap_vector_store(&vectors, args.dimensions.get())?),
         None => None,
     };
-    let queries = SliceFloatVectorStore::new(
-        unsafe { memmap2::Mmap::map(&File::open(args.queries)?)? },
-        args.dimensions,
-    );
+    let queries = new_mmap_vector_store(&args.queries, args.dimensions.get())?;
     let limit = std::cmp::min(
-        args.num_queries
-            .map(NonZeroUsize::get)
-            .unwrap_or(queries.len()),
+        args.num_queries.map(NonZero::get).unwrap_or(queries.len()),
         queries.len(),
     );
 
     let mut stats = GraphSearchStats::default();
     let recall_state = if let Some((p, k)) = args.neighbors.zip(args.recall_k) {
         Some(RecallState {
-            neighbors: SliceU32VectorStore::new(
-                unsafe { memmap2::Mmap::map(&File::open(p)?)? },
-                NonZeroUsize::new(100).unwrap(),
-            ),
+            neighbors: new_mmap_vector_store(&p, 100)?,
             k: k.get(),
         })
     } else {
@@ -430,9 +418,7 @@ fn vamana_search(args: VamanaSearchArgs) -> std::io::Result<()> {
 
         if let Some(recall_state) = recall_state.as_ref() {
             let (ref mut matched, ref mut total) = recall_stats.get_or_insert((0, 0));
-            let mut expected: Vec<u32> = recall_state
-                .neighbors
-                .get(i)
+            let mut expected: Vec<u32> = recall_state.neighbors[i]
                 .iter()
                 .take(recall_state.k)
                 .copied()

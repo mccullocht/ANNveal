@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
     io::Write,
     iter::FusedIterator,
-    num::NonZeroUsize,
+    num::NonZero,
     ops::{AddAssign, Deref, Range},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -24,7 +24,7 @@ use thread_local::ThreadLocal;
 use crate::{
     graph::{EdgePruner, Graph, Neighbor, NeighborSet},
     scorer::{DefaultQueryScorer, QueryScorer, VectorScorer},
-    store::VectorStore,
+    store::{MeanVectorStore, VectorStore},
     utils::FixedBitSet,
 };
 
@@ -143,7 +143,7 @@ pub struct GraphSearcher {
 
 impl GraphSearcher {
     /// Create a new GraphSearcher that will return k results searching.
-    pub fn new(k: NonZeroUsize) -> Self {
+    pub fn new(k: NonZero<usize>) -> Self {
         Self {
             results: NeighborResultSet::new(k.into()),
             seen: AHashSet::new(),
@@ -173,7 +173,7 @@ impl GraphSearcher {
             return;
         }
         let entry_point = graph.entry_point().unwrap();
-        let score = query_scorer.score(store.get(entry_point));
+        let score = query_scorer.score(&store[entry_point]);
         self.seen.insert(entry_point);
         self.results.add((entry_point as u32, score).into());
 
@@ -185,7 +185,7 @@ impl GraphSearcher {
                     continue;
                 }
 
-                let score = query_scorer.score(store.get(neighbor_id));
+                let score = query_scorer.score(&store[neighbor_id]);
                 self.results.add((neighbor_id as u32, score).into());
             }
         }
@@ -208,7 +208,7 @@ impl GraphSearcher {
 /// `GraphBuilder` is used to build a vamana graph.
 pub struct GraphBuilder<'a, V, S, C> {
     max_degree: usize,
-    beam_width: NonZeroUsize,
+    beam_width: NonZero<usize>,
     alpha: f32,
     store: &'a V,
     scorer: S,
@@ -221,7 +221,7 @@ pub struct GraphBuilder<'a, V, S, C> {
 
 impl<'a, V, S, C> GraphBuilder<'a, V, S, C>
 where
-    V: VectorStore + Sync + Send,
+    V: MeanVectorStore + Sync + Send,
     S: VectorScorer<Vector = V::Vector> + Sync + Send,
     C: Send + Sync + Borrow<V::Vector>,
     V::Vector: ToOwned<Owned = C>,
@@ -237,8 +237,8 @@ where
     /// * `alpha` is a hyper parameter that loosens filtering on longer edges
     ///   when pruning the graph.
     pub fn new(
-        max_degree: NonZeroUsize,
-        beam_width: NonZeroUsize,
+        max_degree: NonZero<usize>,
+        beam_width: NonZero<usize>,
         alpha: f32,
         store: &'a V,
         scorer: S,
@@ -281,7 +281,7 @@ where
     /// *Panics* if `node` is out of range.
     fn add_node(&self, node: usize) {
         assert!(node < self.store.len());
-        let query = self.store.get(node);
+        let query = &self.store[node];
         let centroid_neighbor = Neighbor::from((
             node as u32,
             self.scorer.score(query, self.mean_vector.borrow()),
@@ -309,10 +309,10 @@ where
         {
             searcher.results.add(Neighbor::from((
                 *n as u32,
-                self.scorer.score(query, self.store.get(*n)),
+                self.scorer.score(query, &self.store[*n]),
             )));
         }
-        let query_scorer = DefaultQueryScorer::new(self.store.get(node), &self.scorer);
+        let query_scorer = DefaultQueryScorer::new(&self.store[node], &self.scorer);
         // The paper uses a "visisted" set instead of the result set here. The visited set is a
         // super set of the result set and only has value if we think pruning would remove so many
         // edges that we need several hundred additional nodes to properly saturate the graph. In
@@ -348,7 +348,7 @@ where
     }
 }
 
-impl<'a, V, S, C> EdgePruner for GraphBuilder<'a, V, S, C>
+impl<V, S, C> EdgePruner for GraphBuilder<'_, V, S, C>
 where
     V: VectorStore + Sync + Send,
     S: VectorScorer<Vector = V::Vector> + Sync + Send,
@@ -378,13 +378,13 @@ where
                     continue;
                 }
 
-                let n_vector = self.store.get(n.id as usize);
+                let n_vector = &self.store[n.id as usize];
                 // Check if this vector is closer to any already selected neighbor than it is to
                 // the node itself. If it is not, then select this node.
                 if !selected
                     .iter()
                     .take_while(|a| *a < i)
-                    .any(|a| self.scorer.score(n_vector, self.store.get(a)) > n.score * cur_alpha)
+                    .any(|a| self.scorer.score(n_vector, &self.store[a]) > n.score * cur_alpha)
                 {
                     selected.set(i);
                     if selected.len() >= self.max_degree {
@@ -475,7 +475,7 @@ pub struct MutableGraph {
 }
 
 impl MutableGraph {
-    fn new(len: usize, max_degree: NonZeroUsize) -> Self {
+    fn new(len: usize, max_degree: NonZero<usize>) -> Self {
         let mut nodes = Vec::with_capacity(len);
         nodes.resize_with(len, || {
             RwLock::new(MutableGraphNode::with_capacity(max_degree.get() * 2))
@@ -582,7 +582,7 @@ impl<'a> NeighborNodeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for NeighborNodeIterator<'a> {
+impl Iterator for NeighborNodeIterator<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -594,12 +594,15 @@ impl<'a> Iterator for NeighborNodeIterator<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for NeighborNodeIterator<'a> {}
+impl ExactSizeIterator for NeighborNodeIterator<'_> {}
 
-impl<'a> FusedIterator for NeighborNodeIterator<'a> {}
+impl FusedIterator for NeighborNodeIterator<'_> {}
 
 impl Graph for MutableGraph {
-    type NeighborEdgeIterator<'c> = NeighborNodeIterator<'c> where Self: 'c;
+    type NeighborEdgeIterator<'c>
+        = NeighborNodeIterator<'c>
+    where
+        Self: 'c;
 
     fn entry_point(&self) -> Option<usize> {
         let entry_point: Neighbor = self.entry_point.load(Ordering::Relaxed).into();
@@ -638,7 +641,7 @@ impl<D> ImmutableMemoryGraph<D> {
         if rep.len() < 8 {
             return Err("rep too short to contain a valid graph");
         }
-        let (num_nodes, rep) = Self::decode_u32(&rep);
+        let (num_nodes, rep) = Self::decode_u32(rep);
         if num_nodes == 0 {
             return Ok(Self {
                 data,
@@ -687,8 +690,8 @@ pub struct ImmutableEdgeIterator<'a> {
     it: std::slice::Iter<'a, u32>,
 }
 
-impl<'a, 'b> ImmutableEdgeIterator<'a> {
-    fn new<D>(graph: &'b ImmutableMemoryGraph<D>, node: usize) -> Self {
+impl ImmutableEdgeIterator<'_> {
+    fn new<D>(graph: &ImmutableMemoryGraph<D>, node: usize) -> Self {
         let begin = graph.node_extents[node] as usize;
         let end = graph.node_extents[node + 1] as usize;
         Self {
@@ -697,7 +700,7 @@ impl<'a, 'b> ImmutableEdgeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for ImmutableEdgeIterator<'a> {
+impl Iterator for ImmutableEdgeIterator<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -709,12 +712,15 @@ impl<'a> Iterator for ImmutableEdgeIterator<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for ImmutableEdgeIterator<'a> {}
+impl ExactSizeIterator for ImmutableEdgeIterator<'_> {}
 
-impl<'a> FusedIterator for ImmutableEdgeIterator<'a> {}
+impl FusedIterator for ImmutableEdgeIterator<'_> {}
 
 impl<D> Graph for ImmutableMemoryGraph<D> {
-    type NeighborEdgeIterator<'c> = ImmutableEdgeIterator<'c> where Self: 'c;
+    type NeighborEdgeIterator<'c>
+        = ImmutableEdgeIterator<'c>
+    where
+        Self: 'c;
 
     fn entry_point(&self) -> Option<usize> {
         self.entry_point.map(|p| p as usize)
@@ -731,13 +737,14 @@ impl<D> Graph for ImmutableMemoryGraph<D> {
 
 #[cfg(test)]
 mod test {
-    use std::{cmp::Ordering, num::NonZeroUsize};
+    use std::{cmp::Ordering, num::NonZero};
 
     use ordered_float::NotNan;
 
     use crate::{
         graph::Graph,
         scorer::{DefaultQueryScorer, VectorScorer},
+        store::MeanVectorStore,
     };
 
     use rayon::prelude::*;
@@ -747,18 +754,20 @@ mod test {
     impl VectorStore for Vec<u64> {
         type Vector = u64;
 
-        fn get(&self, i: usize) -> &Self::Vector {
-            &self[i]
-        }
-
         fn len(&self) -> usize {
             self.len()
         }
 
+        fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
+            self.as_slice().iter()
+        }
+    }
+
+    impl MeanVectorStore for Vec<u64> {
         fn mean_vector(&self) -> u64 {
             let mut counts = [0usize; 64];
             for i in 0..self.len() {
-                let mut v = *self.get(i);
+                let mut v = self[i];
                 while v != 0 {
                     let j = v.trailing_zeros() as usize;
                     counts[j] += 1;
@@ -800,22 +809,22 @@ mod test {
         }
     }
 
-    fn make_builder<'a, V: VectorStore<Vector = u64> + Sync + Send>(
+    fn make_builder<'a, V: MeanVectorStore<Vector = u64> + Sync + Send>(
         store: &'a V,
     ) -> GraphBuilder<'a, V, Hamming64, u64> {
         GraphBuilder::new(
-            NonZeroUsize::new(4).expect("constant"),
-            NonZeroUsize::new(10).expect("constant"),
+            NonZero::new(4).expect("constant"),
+            NonZero::new(10).expect("constant"),
             1.2f32,
             store,
             Hamming64,
         )
     }
 
-    fn build_graph<B: VectorStore<Vector = u64> + Sync + Send>(store: &B) -> MutableGraph {
+    fn build_graph<B: MeanVectorStore<Vector = u64> + Sync + Send>(store: &B) -> MutableGraph {
         let builder = GraphBuilder::new(
-            NonZeroUsize::new(4).expect("constant"),
-            NonZeroUsize::new(10).expect("constant"),
+            NonZero::new(4).expect("constant"),
+            NonZero::new(10).expect("constant"),
             1.2f32,
             store,
             Hamming64,
@@ -877,7 +886,7 @@ mod test {
     fn search_graph() {
         let store: Vec<u64> = (0u64..16u64).collect();
         let graph: MutableGraph = build_graph(&store);
-        let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
+        let mut searcher = GraphSearcher::new(NonZero::new(8).expect("constant"));
         let query_scorer = DefaultQueryScorer::new(&64, &Hamming64);
         let results = searcher.search(&graph, &store, &query_scorer);
         assert_eq!(
@@ -910,7 +919,7 @@ mod test {
         assert_eq!(get_neighbors(&immutable_graph, 7), vec![3, 5, 6, 15]);
         assert_eq!(get_neighbors(&immutable_graph, 8), vec![0, 9, 10, 12]);
         assert_eq!(get_neighbors(&immutable_graph, 15), vec![7, 11, 13, 14]);
-        let mut searcher = GraphSearcher::new(NonZeroUsize::new(8).expect("constant"));
+        let mut searcher = GraphSearcher::new(NonZero::new(8).expect("constant"));
         let query_scorer = DefaultQueryScorer::new(&64, &Hamming64);
         let results = searcher.search(&immutable_graph, &store, &query_scorer);
         assert_eq!(

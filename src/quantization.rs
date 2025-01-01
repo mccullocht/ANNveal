@@ -345,7 +345,7 @@ impl ScalarQuantizerState {
     }
 
     fn dequantize_to(&self, vector: &[u8], out: &mut [f32]) {
-        let dequantize_one = |v: u8| -> f32 { (self.alpha * v as f32) + self.min_quantile as f32 };
+        let dequantize_one = |v: u8| -> f32 { (self.alpha * v as f32) + self.min_quantile };
         match self.bits.next_power_of_two() {
             2 => {
                 for (i, o) in vector
@@ -625,7 +625,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.samples.next()?;
-        Some(self.store.get(index))
+        Some(&self.store[index])
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -633,4 +633,4 @@ where
     }
 }
 
-impl<'a, S> ExactSizeIterator for SampleIterator<'a, S> where S: VectorStore<Vector = [f32]> {}
+impl<S> ExactSizeIterator for SampleIterator<'_, S> where S: VectorStore<Vector = [f32]> {}

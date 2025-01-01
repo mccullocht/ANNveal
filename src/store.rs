@@ -1,62 +1,97 @@
-use std::{cmp::Ordering, io::Cursor, num::NonZeroUsize, ops::Deref};
+use std::{
+    cmp::Ordering,
+    fs::File,
+    io::Cursor,
+    num::NonZero,
+    ops::{Deref, Index},
+    path::Path,
+};
+
+use memmap2::Mmap;
+use stable_deref_trait::StableDeref;
 
 use crate::quantization::{QuantizationAlgorithm, Quantizer};
 
 /// Dense store of vector data, analogous to a `Vec``.
-pub trait VectorStore {
+pub trait VectorStore: Index<usize, Output = Self::Vector> {
     /// Type of the underlying vector data.
     type Vector: ?Sized;
-
-    /// Obtain a reference to the contents of the vector by VectorId.
-    /// *Panics* if `i`` is out of bounds.
-    fn get(&self, i: usize) -> &Self::Vector;
 
     /// Return the total number of vectors in the store.
     fn len(&self) -> usize;
 
     /// Return an iterator over the vectors in this store.
-    fn iter(&self) -> VectorStoreIterator<'_, Self> {
-        return VectorStoreIterator::new(self);
-    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector>;
+}
 
+/// Trait for vector stores that can compute a mean vector.
+pub trait MeanVectorStore: VectorStore {
     /// Compute the mean vector of all the points in the store.
     fn mean_vector(&self) -> <Self::Vector as ToOwned>::Owned
     where
         Self::Vector: ToOwned;
 }
 
-pub struct VectorStoreIterator<'a, S>
-where
-    S: ?Sized,
-{
-    store: &'a S,
-    next: usize,
+pub struct StableDerefVectorStore<E: 'static, D> {
+    // NB: the contents of data is referenced by raw_vectors.
+    #[allow(dead_code)]
+    data: D,
+    raw_vectors: &'static [E],
+
+    stride: usize,
+    len: usize,
 }
 
-impl<'a, S> VectorStoreIterator<'a, S>
-where
-    S: VectorStore + ?Sized,
-{
-    fn new(store: &'a S) -> Self {
-        Self { store, next: 0 }
-    }
-}
+impl<E: 'static, D: StableDeref<Target = [u8]>> StableDerefVectorStore<E, D> {
+    /// Return a new store where each vector contains stride elements.
+    pub fn new(data: D, stride: usize) -> Self {
+        let elem_width = std::mem::size_of::<E>();
+        let vectorp = data.as_ptr() as *const E;
+        assert!(vectorp.is_aligned());
+        assert_eq!(data.len() % (elem_width * stride), 0);
+        let len = data.len() / (stride * elem_width);
 
-impl<'a, S> Iterator for VectorStoreIterator<'a, S>
-where
-    S: VectorStore,
-{
-    type Item = &'a S::Vector;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next < self.store.len() {
-            let v = self.store.get(self.next);
-            self.next += 1;
-            Some(v)
-        } else {
-            None
+        // Safety: StableDeref guarantees the pointer is stable even after a move.
+        let raw_vectors: &'static [E] =
+            unsafe { std::slice::from_raw_parts(vectorp, data.len() / elem_width) };
+        Self {
+            data,
+            raw_vectors,
+            stride,
+            len,
         }
     }
+}
+
+impl<E: 'static, D: StableDeref<Target = [u8]>> VectorStore for StableDerefVectorStore<E, D> {
+    type Vector = [E];
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
+        self.raw_vectors.chunks(self.stride)
+    }
+}
+
+impl<E: 'static, D: StableDeref<Target = [u8]>> Index<usize> for StableDerefVectorStore<E, D> {
+    type Output = [E];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let start = index * self.stride;
+        let end = start + self.stride;
+        &self.raw_vectors[start..end]
+    }
+}
+
+/// Create a new vector store over file at path backed by mmap().
+pub fn new_mmap_vector_store<E: 'static>(
+    path: &Path,
+    stride: usize,
+) -> std::io::Result<StableDerefVectorStore<E, Mmap>> {
+    let map = unsafe { Mmap::map(&File::open(path)?)? };
+    Ok(StableDerefVectorStore::new(map, stride))
 }
 
 // XXX more generally I could compute a mean float vector when *quantizing* and write it into the
@@ -73,7 +108,7 @@ impl<S> SliceQuantizedVectorStore<S>
 where
     S: Deref<Target = [u8]>,
 {
-    pub fn new(data: S, dimensions: NonZeroUsize) -> Self {
+    pub fn new(data: S, dimensions: NonZero<usize>) -> Self {
         let mut cursor = Cursor::new(&*data);
         let (quantizer, footer_len) =
             Quantizer::read_footer(dimensions.get(), &mut cursor).unwrap();
@@ -97,10 +132,10 @@ where
     fn mean_binary_vector(&self) -> Vec<u8> {
         // NB: this _could_ be paralellized, but it also only takes 1.6s to compute the centroid
         // over 1M 1536d vectors so it's not a huge problem.
-        let dim = self.get(0).len() * 8;
+        let dim = self[0].len() * 8;
         let mut counts = vec![0usize; dim];
         for i in 0..self.len() {
-            let v = self.get(i);
+            let v = &self[i];
             for (j, sv) in v.chunks(8).enumerate() {
                 let mut sv64: u64 = if sv.len() == 8 {
                     u64::from_le_bytes(sv.try_into().unwrap())
@@ -243,16 +278,26 @@ where
 {
     type Vector = [u8];
 
-    fn get(&self, i: usize) -> &Self::Vector {
-        let start = i * self.stride;
-        let end = start + self.stride;
-        &self.data[start..end]
-    }
-
     fn len(&self) -> usize {
         self.len
     }
 
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Self::Vector> {
+        self.data.chunks(self.stride).take(self.len)
+    }
+}
+
+impl<S: Deref<Target = [u8]>> Index<usize> for SliceQuantizedVectorStore<S> {
+    type Output = [u8];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let start = index * self.stride;
+        let end = start + self.stride;
+        &self.data[start..end]
+    }
+}
+
+impl<S: Deref<Target = [u8]>> MeanVectorStore for SliceQuantizedVectorStore<S> {
     fn mean_vector(&self) -> <Self::Vector as ToOwned>::Owned
     where
         Self::Vector: ToOwned,
@@ -266,91 +311,5 @@ where
             }
             QuantizationAlgorithm::Scalar(bits) => self.mean_scalar_vector(bits),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct SliceFloatVectorStore<S> {
-    data: S,
-    stride: usize,
-    len: usize,
-}
-
-impl<S> SliceFloatVectorStore<S>
-where
-    S: AsRef<[u8]>,
-{
-    pub fn new(data: S, dimensions: NonZeroUsize) -> Self {
-        assert_eq!(data.as_ref().len() % std::mem::size_of::<f32>(), 0);
-        let stride = dimensions.get() * std::mem::size_of::<f32>();
-        assert_eq!(data.as_ref().len() % stride, 0); // XXX improve error handling
-        assert!(unsafe { data.as_ref().align_to::<f32>().0.is_empty() });
-        let len = data.as_ref().len() / stride;
-        Self { data, stride, len }
-    }
-}
-
-impl<S> VectorStore for SliceFloatVectorStore<S>
-where
-    S: AsRef<[u8]>,
-{
-    type Vector = [f32];
-
-    fn get(&self, i: usize) -> &Self::Vector {
-        let start = i * self.stride;
-        let end = start + self.stride;
-        // safety: we ensured that the slice aligned correctly at construction.
-        return unsafe { self.data.as_ref()[start..end].align_to::<f32>().1 };
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn mean_vector(&self) -> Vec<f32> {
-        unimplemented!()
-    }
-}
-
-#[derive(Debug)]
-pub struct SliceU32VectorStore<S> {
-    data: S,
-    stride: usize,
-    len: usize,
-}
-
-impl<S> SliceU32VectorStore<S>
-where
-    S: AsRef<[u8]>,
-{
-    pub fn new(data: S, dimensions: NonZeroUsize) -> Self {
-        assert_eq!(data.as_ref().len() % std::mem::size_of::<u32>(), 0);
-        let stride = dimensions.get() * std::mem::size_of::<u32>();
-        assert_eq!(data.as_ref().len() % stride, 0); // XXX improve error handling
-        assert!(unsafe { data.as_ref().align_to::<u32>().0.is_empty() });
-        let len = data.as_ref().len() / stride;
-        Self { data, stride, len }
-    }
-}
-
-impl<S> VectorStore for SliceU32VectorStore<S>
-where
-    S: AsRef<[u8]>,
-{
-    type Vector = [u32];
-
-    fn get(&self, i: usize) -> &Self::Vector {
-        let start = i * self.stride;
-        let end = start + self.stride;
-        // safety: we ensured that the slice aligned correctly at construction.
-        return unsafe { self.data.as_ref()[start..end].align_to::<u32>().1 };
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn mean_vector(&self) -> Vec<u32> {
-        unimplemented!()
     }
 }
