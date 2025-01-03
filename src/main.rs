@@ -504,6 +504,7 @@ fn kmeans_tree_build(args: KMeansTreeBuildArgs) -> std::io::Result<()> {
         args.num_children,
         &KMeansTreeParams::default(),
         &KMeansParams::default(),
+        0,
         &mut next_leaf_id,
     );
     Ok(())
