@@ -12,18 +12,22 @@ use simsimd::SpatialSimilarity;
 use crate::VectorStore;
 
 pub struct KMeansTreeParams {
+    /// Maximum number of interior levels in the tree.
+    ///
+    /// Google recommends a 2-level tree if there are < 10M vectors and a 3-level index for > 100M.
+    /// In general more levels optimizes indexing time; fewer levels optimizes recall.
+    /// See: https://cloud.google.com/alloydb/docs/ai/tune-indexes?resource=scann#tune-scann-indexes
+    pub max_levels: usize,
     /// Maximum number of vectors in a single leaf node.
     pub max_leaf_size: usize,
-    // XXX need to limit the depth of the tree, especially because the algorithm used to create
-    // the tree does not terminate even if the subset is empty.
-    // Google recommends a 2-level tree if there are < 10M vectors and a 3-level index for > 100M.
-    // Otherwise use more levels to optimize for indexing time and fewer to optimize for recall.
-    // https://cloud.google.com/alloydb/docs/ai/tune-indexes?resource=scann#tune-scann-indexes
 }
 
 impl Default for KMeansTreeParams {
     fn default() -> Self {
-        Self { max_leaf_size: 1 }
+        Self {
+            max_levels: 2,
+            max_leaf_size: 1,
+        }
     }
 }
 
@@ -49,7 +53,7 @@ impl KMeansTreeNode {
         next_leaf_id: &mut usize,
     ) -> Self {
         assert!(level < 4);
-        if training_data.len() <= tree_params.max_leaf_size {
+        if training_data.len() <= tree_params.max_leaf_size || level >= tree_params.max_levels {
             let leaf_id = *next_leaf_id;
             *next_leaf_id += 1;
             return KMeansTreeNode {

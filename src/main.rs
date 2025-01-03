@@ -499,7 +499,7 @@ fn kmeans_tree_build(args: KMeansTreeBuildArgs) -> std::io::Result<()> {
         well_sample(float_vector_store.len(), args.sample_size.get()),
     );
     let mut next_leaf_id = 0usize;
-    let _root = KMeansTreeNode::train(
+    let root = KMeansTreeNode::train(
         &kmeans_sample_vector_store,
         args.num_children,
         &KMeansTreeParams::default(),
@@ -507,7 +507,8 @@ fn kmeans_tree_build(args: KMeansTreeBuildArgs) -> std::io::Result<()> {
         0,
         &mut next_leaf_id,
     );
-    Ok(())
+    let encoded = rmp_serde::to_vec(&root).unwrap();
+    std::fs::write(args.kmeans_tree, &encoded)
 }
 
 fn main() -> std::io::Result<()> {
